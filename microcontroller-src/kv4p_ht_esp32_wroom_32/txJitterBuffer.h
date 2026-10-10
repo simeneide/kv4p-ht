@@ -213,6 +213,19 @@ public:
     }
   }
 
+  // Credit currently held for one session (the host's window is per session).
+  size_t heldAckBytesFor(const void *ackTag) const {
+    size_t held = 0;
+    size_t idx = _head;
+    for (size_t i = 0; i < _count; ++i) {
+      if (_entries[idx].ackTag == ackTag) {
+        held += _entries[idx].ackBytes;
+      }
+      idx = (idx + 1) % CAPACITY_ENTRIES;
+    }
+    return held;
+  }
+
   uint32_t bufferedMs() const {
     return bytesToMs(_byteCount);
   }

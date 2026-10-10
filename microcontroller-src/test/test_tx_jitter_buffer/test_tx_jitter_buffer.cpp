@@ -173,6 +173,17 @@ void test_forget_ack_tag_drops_credits_but_keeps_audio() {
   TEST_ASSERT_EQUAL_UINT16(0, meta.ackBytes);
 }
 
+void test_held_credit_is_tracked_per_session() {
+  Buffer b = makeBuffer();
+  auto f = block(1);
+  b.push(f.data(), f.size(), &SESSION_A, 137, 0);
+  b.push(f.data(), f.size(), &SESSION_B, 140, 0);
+  b.push(f.data(), f.size(), &SESSION_A, 137, 0);
+  TEST_ASSERT_EQUAL_UINT32(274, b.heldAckBytesFor(&SESSION_A));
+  TEST_ASSERT_EQUAL_UINT32(140, b.heldAckBytesFor(&SESSION_B));
+  TEST_ASSERT_EQUAL_UINT32(414, b.heldAckBytes());
+}
+
 void test_arrival_gap_and_peak_are_tracked() {
   Buffer b = makeBuffer();
   auto f = block(1);
@@ -207,6 +218,7 @@ int main(int, char **) {
   RUN_TEST(test_push_fails_when_full_and_counts_overflow);
   RUN_TEST(test_entry_limit_is_enforced);
   RUN_TEST(test_forget_ack_tag_drops_credits_but_keeps_audio);
+  RUN_TEST(test_held_credit_is_tracked_per_session);
   RUN_TEST(test_arrival_gap_and_peak_are_tracked);
   RUN_TEST(test_reset_clears_state);
   return UNITY_END();

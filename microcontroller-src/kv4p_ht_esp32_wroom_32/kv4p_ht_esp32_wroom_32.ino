@@ -289,8 +289,15 @@ void drainRadioSerial() {
 
 void reconcileDesiredState(bool sendReport = true) {
   lastDeviceStateError = DEVICE_STATE_ERROR_NONE;
-  // Never keep transmitting buffered audio on a channel that is being retuned.
+  // A PTT release would normally let buffered audio drain while keyed, but
+  // never retune or refilter the SA818 under a live carrier: unkey first.
+  bool keepKeyed = (desiredState.flags & HOST_STATE_PTT_REQUESTED) && txAllowedByHost();
   bool retuning = (desiredState.flags & HOST_STATE_RADIO_CONFIG_VALID) && radioConfigChanged();
+  bool refiltering = !filtersApplied
+    || desiredFilterFlags() != (appliedState.flags & (HOST_STATE_FILTER_PRE | HOST_STATE_FILTER_HIGH | HOST_STATE_FILTER_LOW));
+  if (mode == MODE_TX && !keepKeyed && (retuning || refiltering)) {
+    setMode(rxIdleMode());
+  }
   bool wantHigh = desiredState.flags & HOST_STATE_HIGH_POWER;
   if (hw.features.hasHL) {
     digitalWrite(hw.pins.pinHl, wantHigh ? LOW : HIGH);
@@ -335,7 +342,7 @@ void reconcileDesiredState(bool sendReport = true) {
   if ((desiredState.flags & HOST_STATE_PTT_REQUESTED) && txAllowedByHost()) {
     txPlayoutCancelDrain();
     setMode(MODE_TX);
-  } else if (mode == MODE_TX && txAllowedByHost() && !retuning && txPlayoutRequestDrain()) {
+  } else if (mode == MODE_TX && txAllowedByHost() && txPlayoutRequestDrain()) {
     // PTT released with voice still buffered: stay keyed until it has been
     // played; txAudioLoop() switches to RX when the buffer is empty.
   } else {
@@ -353,10 +360,7 @@ void setMode(Mode newMode) {
   }
   freeDvRx.reset();
   freeDvTx.reset();
-  if (mode == MODE_TX) {
-    txPlayoutEnd();
-    logTxSummary();
-  }
+  bool wasTx = mode == MODE_TX;
   mode = newMode;
   markDeviceStateDirty();
   switch (mode) {
@@ -381,13 +385,22 @@ void setMode(Mode newMode) {
 #endif
       endI2SRx();
       initI2STx();
-      txPlayoutBegin();
+      txPlayoutBegin((desiredState.flags & HOST_STATE_PTT_REQUESTED) != 0);
       bleKissStream.resetRxGapStats();
-      if (protocolHasBleSession() && bleKissStream.requestConnParamsIfNeeded()) {
+      if (txPlayout.hostVoice && protocolHasBleSession() && bleKissStream.requestConnParamsIfNeeded()) {
         debug_log_printf(COMMAND_DEBUG_INFO, "BLE link: re-requested %u-%u x1.25 ms, latency 0 for TX",
                          bleKissConfig().connMinInterval, bleKissConfig().connMaxInterval);
       }
     break;
+  }
+  // Bookkeeping only after the transmitter is off and I2S stopped, so slow
+  // log or credit writes never extend the carrier.
+  if (wasTx) {
+    bool hostVoice = txPlayout.hostVoice;
+    txPlayoutEnd();
+    if (hostVoice) {
+      logTxSummary();
+    }
   }
   // Record key/unkey at once: AX.25 transmits synchronously, so loop() does
   // not run while it is keyed.
@@ -415,7 +428,7 @@ void logTxSummary() {
   debug_log_printf(COMMAND_DEBUG_INFO,
                    "TX summary: keyed=%lu ms frames_in=%lu bytes_in=%lu played=%lu (~%lu ms) preroll=%lu ms "
                    "reached=%s@%lu ms underruns=%lu gap_silence=%lu ms lead_silence=%lu ms max_frame_gap=%lu ms "
-                   "max_ble_write_gap=%lu ms peak=%lu B (%lu ms) overflows=%lu late=%lu discarded=%lu drain=%lu ms "
+                   "max_ble_write_gap=%lu ms peak=%lu B (%lu ms) overflows=%lu late=%lu i2s_blocked=%lu ms discarded=%lu drain=%lu ms "
                    "ble=%s interval=%u.%02u ms latency=%u mtu=%u dle=%u/%u heap=%u min=%u",
                    (unsigned long)keyedMs, (unsigned long)js.framesIn, (unsigned long)js.bytesIn,
                    (unsigned long)js.framesOut, (unsigned long)audioMs, (unsigned long)txJitter.prerollMs(),
@@ -425,6 +438,7 @@ void logTxSummary() {
                    (unsigned long)js.maxArrivalGapMs, (unsigned long)bleKissStream.rxMaxGapMs(),
                    (unsigned long)js.peakBytes, (unsigned long)txJitter.bytesToMs(js.peakBytes),
                    (unsigned long)js.overflows, (unsigned long)txPlayout.lateTicks,
+                   (unsigned long)((txOutCounter.blockedUs - txPlayout.blockedUsAtStart) / 1000),
                    (unsigned long)txPlayout.framesDiscardedAtEnd, (unsigned long)txPlayout.drainMs,
                    protocolHasBleSession() ? "yes" : "no", (link.connInterval * 125) / 100,
                    (link.connInterval * 125) % 100, link.connLatency, link.mtu, link.txOctets, link.rxOctets,

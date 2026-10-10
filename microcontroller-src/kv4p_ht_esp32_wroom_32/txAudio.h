@@ -45,8 +45,9 @@ static constexpr uint32_t TX_PREROLL_USB_MS = 40;
 // the clock: write a frame once a frame plus one DMA buffer has been consumed
 // (the extra buffer keeps i2s_write from ever waiting). Written audio reaches
 // the DAC about 40 to 55 ms later.
+static constexpr int TX_DMA_BUFFER_COUNT = 6;
 static constexpr int64_t TX_DMA_BUFFER_SAMPLES_48K = 512;
-static constexpr int64_t TX_DMA_RING_SAMPLES_48K = 6 * TX_DMA_BUFFER_SAMPLES_48K;
+static constexpr int64_t TX_DMA_RING_SAMPLES_48K = TX_DMA_BUFFER_COUNT * TX_DMA_BUFFER_SAMPLES_48K;
 static constexpr int64_t TX_PLAYOUT_WRITE_DEFICIT_48K = AUDIO_FRAME_SAMPLES_48K + TX_DMA_BUFFER_SAMPLES_48K;
 // If the loop falls this far behind, the DAC has started replaying old
 // buffers. Do not try to make up the lost time; resume as if one frame late.
@@ -69,19 +70,27 @@ static constexpr size_t TX_JITTER_CAPACITY_BYTES = 4096;
 static constexpr size_t TX_JITTER_CAPACITY_ENTRIES = 64;
 
 // Counts PCM bytes on their way to I2S, so playout can be paced against the
-// clock without querying (or blocking on) the DMA.
+// clock without querying the DMA. Also measures time spent blocked in
+// i2s_write, which should stay near zero; if it grows, the DAC is running
+// slower than the clock model assumes.
 class CountingPrint : public Print {
 public:
   explicit CountingPrint(Print &target) : target(target) {}
   size_t write(uint8_t b) override {
-    bytes++;
-    return target.write(b);
+    return write(&b, 1);
   }
   size_t write(const uint8_t *data, size_t len) override {
     bytes += len;
-    return target.write(data, len);
+    int64_t start = esp_timer_get_time();
+    size_t written = target.write(data, len);
+    int64_t took = esp_timer_get_time() - start;
+    if (took > 2000) {
+      blockedUs += (uint64_t)took;
+    }
+    return written;
   }
   uint64_t bytes = 0;
+  uint64_t blockedUs = 0;
 private:
   Print &target;
 };
@@ -168,13 +177,13 @@ static_assert((AUDIO_FRAME_SAMPLES_WIRE * sizeof(int16_t)) % sizeof(txSilenceChu
 
 struct TxPlayoutStats {
   bool active = false;
+  bool hostVoice = false;           // Keyed by host PTT (not an AX.25 packet).
   bool prerollChosen = false;
   uint32_t startMs = 0;
   uint32_t endMs = 0;
   uint32_t leadSilenceSamplesWire = 0;  // Silence before the first audio (pre-roll).
   uint32_t gapSilenceSamplesWire = 0;   // Silence filling underruns mid-transmission.
   uint32_t lateTicks = 0;           // The main loop fell behind the DAC (DMA ran dry).
-  uint32_t creditsReturnedAtEnd = 0;
   uint32_t framesDiscardedAtEnd = 0;
   uint32_t drainMs = 0;
   bool releasePending = false;
@@ -185,13 +194,44 @@ struct TxPlayoutStats {
   int64_t deficitAdjust = 0;
   int64_t lastAudioWriteUs = 0;
   bool audioWritten = false;
+  uint64_t blockedUsAtStart = 0;
 };
 TxPlayoutStats txPlayout;
 
-static void txReturnCredit(const TxJitterBuffer<TX_JITTER_CAPACITY_BYTES, TX_JITTER_CAPACITY_ENTRIES>::Entry &meta) {
+using TxJitterEntry = TxJitterBuffer<TX_JITTER_CAPACITY_BYTES, TX_JITTER_CAPACITY_ENTRIES>::Entry;
+
+// Credits are collected per session and sent as one WINDOW_UPDATE per flush,
+// so returning many frames at once (catching up, or discarding at the end of
+// a transmission) does not flood a congested BLE notify queue.
+struct TxCreditBatch {
+  static constexpr size_t MAX_SESSIONS = 3;  // USB, Classic, BLE
+  const ProtocolSession *session[MAX_SESSIONS] = {};
+  uint32_t bytes[MAX_SESSIONS] = {};
+};
+TxCreditBatch txCredits;
+
+static void txQueueCredit(const TxJitterEntry &meta) {
   const ProtocolSession *session = static_cast<const ProtocolSession *>(meta.ackTag);
-  if (session != nullptr && meta.ackBytes > 0 && protocolSessionConnected(*session)) {
-    sendWindowAck(*session->stream, meta.ackBytes);
+  if (session == nullptr || meta.ackBytes == 0) {
+    return;
+  }
+  for (size_t i = 0; i < TxCreditBatch::MAX_SESSIONS; i++) {
+    if (txCredits.session[i] == session || txCredits.session[i] == nullptr) {
+      txCredits.session[i] = session;
+      txCredits.bytes[i] += meta.ackBytes;
+      return;
+    }
+  }
+}
+
+static void txFlushCredits() {
+  for (size_t i = 0; i < TxCreditBatch::MAX_SESSIONS; i++) {
+    const ProtocolSession *session = txCredits.session[i];
+    if (session != nullptr && txCredits.bytes[i] > 0 && protocolSessionConnected(*session)) {
+      sendWindowAck(*session->stream, txCredits.bytes[i]);
+    }
+    txCredits.session[i] = nullptr;
+    txCredits.bytes[i] = 0;
   }
 }
 
@@ -219,6 +259,9 @@ void initI2STx() {
   config.use_apll = true;
   config.auto_clear = false;
   config.signal_type = PDM;
+  // Playout pacing below depends on this DMA geometry; set it explicitly.
+  config.buffer_count = TX_DMA_BUFFER_COUNT;
+  config.buffer_size = TX_DMA_BUFFER_SAMPLES_48K;
   out.begin(config);
   txUpsample.begin();
   txVolumeMeter.begin(txAudioInfo);
@@ -264,11 +307,22 @@ static void txPlayFrame(const uint8_t *src, size_t len) {
 }
 
 static void txPlayOldest() {
-  TxJitterBuffer<TX_JITTER_CAPACITY_BYTES, TX_JITTER_CAPACITY_ENTRIES>::Entry meta;
+  TxJitterEntry meta;
   if (txJitter.pop(txDecode, meta) > 0) {
     txAfterAudioWrite();
-    txReturnCredit(meta);
+    txQueueCredit(meta);
   }
+}
+
+// Drop everything buffered, returning its credit.
+static void txDiscardBuffered() {
+  TxJitterEntry meta;
+  while (!txJitter.empty()) {
+    txJitter.discard(meta);
+    txPlayout.framesDiscardedAtEnd++;
+    txQueueCredit(meta);
+  }
+  txFlushCredits();
 }
 
 // One wire frame (249 samples) of silence through the upsampler.
@@ -278,13 +332,15 @@ static void txWriteSilenceFrame() {
   }
 }
 
-// Called when entering MODE_TX.
-void txPlayoutBegin() {
+// Called when entering MODE_TX. hostVoice is false for AX.25 packets.
+void txPlayoutBegin(bool hostVoice) {
   uint32_t now = millis();
   txJitter.reset(now, TX_PREROLL_WIRELESS_MS);
   txPlayout = TxPlayoutStats{};
   txPlayout.active = true;
+  txPlayout.hostVoice = hostVoice;
   txPlayout.startMs = now;
+  txPlayout.blockedUsAtStart = txOutCounter.blockedUs;
   txPlayout.anchorUs = esp_timer_get_time();
   txPlayout.anchorBytes = txOutCounter.bytes;
 }
@@ -295,15 +351,8 @@ void txPlayoutEnd() {
   if (!txPlayout.active) {
     return;
   }
-  TxJitterBuffer<TX_JITTER_CAPACITY_BYTES, TX_JITTER_CAPACITY_ENTRIES>::Entry meta;
-  while (!txJitter.empty()) {
-    txJitter.discard(meta);
-    txPlayout.framesDiscardedAtEnd++;
-    if (meta.ackBytes > 0) {
-      txPlayout.creditsReturnedAtEnd += meta.ackBytes;
-    }
-    txReturnCredit(meta);
-  }
+  txFlushCredits();
+  txDiscardBuffered();
   if (txPlayout.releasePending) {
     txPlayout.drainMs = millis() - txPlayout.releaseStartMs;
   }
@@ -336,8 +385,14 @@ bool txPlayoutRequestDrain() {
   return true;
 }
 
+// PTT pressed again while draining: carry on with the same transmission.
 void txPlayoutCancelDrain() {
-  txPlayout.releasePending = false;
+  if (txPlayout.releasePending) {
+    txPlayout.releasePending = false;
+    // setMode(MODE_TX) is a no-op while still keyed, so restart the TX
+    // watchdog here; otherwise the new over inherits the old frame time.
+    txWatchDog.reset(millis());
+  }
 }
 
 void processTxAudio(ProtocolSession &session, uint8_t *src, size_t len) {
@@ -366,12 +421,21 @@ void processTxAudio(ProtocolSession &session, uint8_t *src, size_t len) {
     // the ADPCM byte stream would misalign every block after it.
     txPlayOldest();
   }
+  txFlushCredits();
   esp_task_wdt_reset();
 }
 
 // Feed the DAC: one call per loop iteration while keyed for voice.
 void txPlayoutLoop() {
-  if (!txPlayout.active || !txStreamConfigured || freeDv2400bEnabled()) {
+  if (!txPlayout.active || !txStreamConfigured) {
+    return;
+  }
+  if (freeDv2400bEnabled()) {
+    // Switched to digital voice while keyed: buffered analog audio will never
+    // play, so hand its credit back now rather than starving the host.
+    if (!txJitter.empty()) {
+      txDiscardBuffered();
+    }
     return;
   }
   int64_t deficit = txPlayoutDeficitSamples();
@@ -383,8 +447,9 @@ void txPlayoutLoop() {
   }
   uint32_t now = millis();
   bool creditPressure = false;
-  if (txPlayout.lastSession != nullptr && txPlayout.lastSession->windowSize > TX_CREDIT_RESERVE_BYTES) {
-    creditPressure = txJitter.heldAckBytes() + TX_CREDIT_RESERVE_BYTES >= txPlayout.lastSession->windowSize;
+  const ProtocolSession *session = txPlayout.lastSession;
+  if (session != nullptr && session->windowSize > TX_CREDIT_RESERVE_BYTES) {
+    creditPressure = txJitter.heldAckBytesFor(session) + TX_CREDIT_RESERVE_BYTES >= session->windowSize;
   }
   // A few frames at most per call, so catching up never stalls the main loop.
   for (int i = 0; i < 4 && deficit >= TX_PLAYOUT_WRITE_DEFICIT_48K; i++) {
@@ -406,6 +471,7 @@ void txPlayoutLoop() {
     }
     deficit = txPlayoutDeficitSamples();
   }
+  txFlushCredits();
 }
 
 // True once a pending PTT release has played out (or waited too long).
