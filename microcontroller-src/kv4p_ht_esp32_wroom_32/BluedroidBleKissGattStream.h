@@ -801,6 +801,9 @@ private:
   }
 
   void handleConnect(esp_ble_gatts_cb_param_t *param) {
+    // Anything the main loop queued between the last disconnect and noticing
+    // it (a WINDOW_UPDATE, say) belongs to the old client, not this one.
+    clearQueue();
     _connected = true;
     _notifySubscribed = false;
     resetNotifyDescriptor();
