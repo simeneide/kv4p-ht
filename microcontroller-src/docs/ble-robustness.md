@@ -27,12 +27,13 @@ On every boot the firmware records:
 
 * `esp_reset_reason()` (POWERON, SW, PANIC, INT_WDT, TASK_WDT, WDT, BROWNOUT, ...).
 * A breadcrumb kept in RTC memory (`RTC_NOINIT_ATTR`) that survives software
-  resets, panics and watchdogs: boot counter, last uptime, whether the radio
-  was keyed, whether high power was selected and how long the transmission had
-  lasted. It is updated every 100 ms and on every key/unkey. It does not
-  survive a power-on or brownout reset (the rail dropped), so it is only
-  reported after other resets.
-* A summary of the core dump in flash, if there is one: crashing task, PC,
+  resets, panics, watchdogs and usually brownouts: boot counter, last uptime,
+  whether the radio was keyed, whether high power was selected and how long
+  the transmission had lasted. It is updated every 100 ms and on every
+  key/unkey (including AX.25 packets), and protected by a check word. It does
+  not survive a power-on, so it is not reported after one.
+* A summary of the core dump in flash, if there is one (read and formatted
+  once at boot, since checking it scans up to 64 KB of flash): crashing task, PC,
   exception cause, faulting address, app ELF SHA and up to 16 backtrace
   addresses. Arduino-ESP32 2.0.17 is built with
   `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y` and `..._DATA_FORMAT_ELF=y`, and
@@ -46,16 +47,19 @@ Where it is reported:
   before any KISS framing, so any serial monitor shows it.
 * As `COMMAND_DEBUG_INFO` text frames to each host session right after HELLO
   (USB, Classic and BLE), and also on USB when a Bluetooth session starts.
+  This repeats on every connect, so count restarts by boot number, not by
+  lines.
 
 Example lines (values illustrative):
 
 ```
-Reset reason: PANIC (Exception/Panic Reset), boot #4; previous boot up 734120 ms, keyed=1 high=1 keyed_for=6120 ms
+Reset reason: PANIC; prev keyed=1 high=1 keyed_for=6120ms up=734120ms; boot #4; Exception/Panic Reset
 Core dump: 11364 bytes at 0x3f0000, task=BTC_TASK pc=0x400d6a1c exccause=29 excvaddr=0x00000002 elf=1a2b3c4d5e6f7a8b bt=0x400d6a1c,0x400d6b80,...
 ```
 
 The first line keeps the wording "Reset reason" that hosts may already look
-for (pgpilot matches it). The protocol is unchanged. Upstream issue #473
+for (pgpilot matches it and keeps the first 120 characters, so the keyed state
+comes first). The protocol is unchanged. Upstream issue #473
 suggested a separate debug GATT characteristic for richer BLE diagnostics, and
 that is still open; these lines only use the debug log channel that already
 exists.
@@ -156,7 +160,10 @@ the DAC's pace:
   is buffered, or when the first buffered frame is 300 ms old (a host that
   cannot fill the target is never stalled), or when the host is nearly out of
   window credit, or when PTT is released. USB gets `TX_PREROLL_USB_MS` (40 ms)
-  because it does not burst. Until then the DAC gets explicit silence.
+  because it does not burst. Classic Bluetooth uses the 300 ms target, but its
+  2048 B window triggers the credit-pressure start at about 1.5 KB held, so in
+  practice it pre-rolls about 170 ms and can never hold more than about 220 ms.
+  Until playout starts the DAC gets explicit silence.
 * **Underrun.** If the buffer runs dry mid-transmission, the firmware writes
   silence (never the stale DMA contents) and goes back to pre-rolling, instead
   of playing each late frame the moment it trickles in. After a stall the
@@ -172,8 +179,12 @@ the DAC's pace:
   if a host overruns it anyway, the oldest frame is played early (nothing is
   dropped, since dropping part of the ADPCM byte stream would misalign every
   later block). Credits for frames still buffered when TX ends (watchdog,
-  runaway timer) are returned too, and credits belonging to a session that
-  disconnected are dropped, since a reconnecting host starts a fresh window.
+  runaway timer, switching to FreeDV while keyed) are returned too, and
+  credits belonging to a session that disconnected are dropped, since a
+  reconnecting host starts a fresh window. Credits are sent as one
+  `COMMAND_WINDOW_UPDATE` per session per loop pass, so returning many frames
+  at once does not flood a congested BLE notify queue. Window pressure is
+  judged per session.
 * **Pacing.** The I2S TX DMA is a ring of 6 x 512 samples (64 ms at 48 kHz)
   that never stops. The loop writes one frame (747 samples at 48 kHz) each time
   a frame plus one DMA buffer has been consumed, measured with
@@ -181,14 +192,26 @@ the DAC's pace:
   block on I2S, the loop keeps spinning, and incoming frames are parsed as fast
   as they arrive. If the loop is held up long enough for the DAC to replay old
   buffers, the summary counts a `late` tick and pacing resumes without trying
-  to catch up.
+  to catch up. The DMA geometry (6 x 512) is set explicitly in `initI2STx()`.
+  The pacing is open loop against `esp_timer`. Both clocks derive from the same
+  crystal and the margin is about 35 ms, so drift should not matter within the
+  200 s runaway limit. The summary's `i2s_blocked` field checks this on real
+  hardware: it should stay at 0 ms.
 * **PTT release.** When PTT is released with audio still buffered, the radio
   stays keyed until the buffer and the DMA ring have played out
   (`TX_DRAIN_MAX_MS` = 1.5 s cap), so the last 300 ms of speech is not cut. The
   previous code also cut the last ~50 ms in the DMA ring at unkey. Re-keying
-  during the drain cancels it. The TX watchdog (778 ms without frames), the
-  runaway timer, and revoking TX_ALLOWED still unkey immediately.
-* **FreeDV 2400B and AX.25** do not use this path.
+  during the drain cancels it and restarts the TX watchdog. The TX watchdog
+  (778 ms without frames), the runaway timer, revoking TX_ALLOWED, and a
+  release that also retunes or refilters the SA818 still unkey immediately (the
+  SA818 is never sent AT commands under a carrier it was asked to drop).
+  End-of-TX bookkeeping (credit returns, the summary line) runs only after the
+  transmitter is off.
+* **FreeDV 2400B and AX.25** do not use this path, and AX.25 packets get no
+  summary line.
+* **Feature bit.** HELLO advertises `FEATURE_HAS_TX_JITTER_BUFFER` (bit 4) so
+  hosts can tell which behaviour they are talking to. Existing hosts ignore
+  unknown bits.
 
 **When to key the SA818.** The transmitter is keyed at PTT-down, as before,
 and the pre-roll goes out as silence on the carrier. Receivers need time to
@@ -204,7 +227,7 @@ before speech, which is normal for a voice over.
 Bluetooth, 40 ms over USB) plus about 50 ms of DMA. On a link that stalls, the
 radio-side backlog is capped by the window; any further backlog is on the host.
 
-**Memory.** The buffer adds about 5.4 KB of static DRAM (4 KB of audio, the
+**Memory.** The buffer adds about 5.5 KB of static DRAM (4 KB of audio, the
 entry table and counters). Static DRAM is the tight resource on this build:
 with Bluetooth enabled the `dram0_0_seg` region is 124,580 B and upstream main
 already used 110,740 B. This change leaves about 8.4 KB of headroom, which is
@@ -213,12 +236,12 @@ and in each TX summary.
 
 ### TX summary line
 
-When a transmission ends, one `COMMAND_DEBUG_INFO` line is sent to every
-connected session including USB, in release builds as well (values
+When a voice transmission ends, one `COMMAND_DEBUG_INFO` line is sent to
+every connected session including USB, in release builds as well (values
 illustrative):
 
 ```
-TX summary: keyed=10342 ms frames_in=622 bytes_in=79616 played=622 (~9679 ms) preroll=300 ms reached=yes@312 ms underruns=2 gap_silence=420 ms lead_silence=312 ms max_frame_gap=388 ms max_ble_write_gap=391 ms peak=3840 B (467 ms) overflows=0 late=0 discarded=0 drain=331 ms ble=yes interval=15.00 ms latency=0 mtu=247 dle=251/251 heap=61234 min=48890
+TX summary: keyed=10342 ms frames_in=622 bytes_in=79616 played=622 (~9679 ms) preroll=300 ms reached=yes@312 ms underruns=2 gap_silence=420 ms lead_silence=312 ms max_frame_gap=388 ms max_ble_write_gap=391 ms peak=3840 B (467 ms) overflows=0 late=0 i2s_blocked=0 ms discarded=0 drain=331 ms ble=yes interval=15.00 ms latency=0 mtu=247 dle=251/251 heap=61234 min=48890
 ```
 
 | Field | Meaning |
@@ -235,12 +258,13 @@ TX summary: keyed=10342 ms frames_in=622 bytes_in=79616 played=622 (~9679 ms) pr
 | `peak` | Highest buffer fill, in bytes and audio time |
 | `overflows` | Frames that did not fit and forced an early play (host overran the window) |
 | `late` | Times the main loop fell behind the DAC |
-| `discarded` | Frames still buffered when TX ended without a drain (watchdog, timeout) |
+| `i2s_blocked` | Time spent blocked in `i2s_write` (should be 0; growth means the DAC runs slower than the pacing model) |
+| `discarded` | Frames still buffered when TX ended without a drain (watchdog, timeout, retune) |
 | `drain` | Time between PTT release and unkey |
 | `ble`, `interval`, `latency`, `mtu`, `dle` | Link state at the end of the transmission |
 | `heap`, `min` | Free heap now and the lowest it has been since boot |
 
-A clean over has `underruns=0 gap_silence=0 overflows=0 late=0 discarded=0`.
+A clean over has `underruns=0 gap_silence=0 overflows=0 late=0 i2s_blocked=0 ms discarded=0`.
 Headset starvation shows up as a large `max_ble_write_gap` and, once a gap
 exceeds what the buffer holds, as `underruns` and `gap_silence`.
 
@@ -299,7 +323,7 @@ a normal build.
    reported.
 4. **Baseline, no headset.** Five overs of about 10 s each, with any sound into
    the phone mic. Expect per over: `underruns=0 gap_silence=0 overflows=0
-   late=0 discarded=0`, `reached` near 300 ms, `drain` about 300 to 400 ms,
+   late=0 i2s_blocked=0 ms discarded=0`, `reached` near 300 ms, `drain` about 300 to 400 ms,
    `max_ble_write_gap` well under 100 ms.
 5. **Headset mic open (HFP/SCO active).** Repeat ten overs of 10 s, with the
    headset as the input. Record `max_ble_write_gap`, `max_frame_gap`,
@@ -312,10 +336,12 @@ a normal build.
    `reached` well under 300 ms, `peak` close to one window of audio (about
    3.3 to 3.8 KB, 400 to 470 ms), `overflows=0`, `underruns=0`, and `keyed` about equal
    to the recording length plus pre-roll and drain.
-7. **Long over.** One 60 s over with the headset. Expect no `late` ticks and a
-   stable `heap`/`min`.
-8. **Release during drain.** Release PTT and press it again within 300 ms.
-   Expect one continuous over (the drain is cancelled), not an unkey/rekey.
+7. **Long over.** One 60 s over with the headset. Expect `late=0` and
+   `i2s_blocked=0 ms` (this is the clock-drift check) and a stable `heap`/`min`.
+8. **Release during drain.** Release PTT and press it again within 300 ms,
+   then keep talking for a few seconds. Expect one continuous over (the drain
+   is cancelled, one summary line at the end) that is not cut by the TX
+   watchdog shortly after the re-press.
 9. **Disconnect mid-over.** Turn off phone Bluetooth while keyed. Expect the
    TX watchdog to unkey within about 0.8 s (`discarded` may be above 0), and
    on reconnect the same boot number in the `Reset reason` line (no restart).
