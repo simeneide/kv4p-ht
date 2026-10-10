@@ -28,13 +28,71 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "state.h"
 #include "utils.h"
 #include "dsp/audioResampler.h"
+#include "txJitterBuffer.h"
+
+// TX playout jitter buffer. See microcontroller-src/docs/ble-robustness.md.
+//
+// Audio that arrives over Bluetooth is held until TX_PREROLL_WIRELESS_MS of it
+// is buffered (or the first frame is that old) before it is played, and again
+// after the buffer runs dry. USB delivers smoothly, so it only gets a small
+// pre-roll to absorb loop and scheduling jitter.
+static constexpr uint32_t TX_PREROLL_WIRELESS_MS = 300;
+static constexpr uint32_t TX_PREROLL_USB_MS = 40;
+// The I2S driver's TX DMA is a ring of 6 x 512 samples (64 ms at 48 kHz) that
+// never stops: a buffer is refilled only when we write, otherwise the DAC
+// replays whatever it held last (auto_clear is off). A write only proceeds
+// without blocking into buffers the DAC has finished, so playout is paced by
+// the clock: write a frame once a frame plus one DMA buffer has been consumed
+// (the extra buffer keeps i2s_write from ever waiting). Written audio reaches
+// the DAC about 40 to 55 ms later.
+static constexpr int64_t TX_DMA_BUFFER_SAMPLES_48K = 512;
+static constexpr int64_t TX_DMA_RING_SAMPLES_48K = 6 * TX_DMA_BUFFER_SAMPLES_48K;
+static constexpr int64_t TX_PLAYOUT_WRITE_DEFICIT_48K = AUDIO_FRAME_SAMPLES_48K + TX_DMA_BUFFER_SAMPLES_48K;
+// If the loop falls this far behind, the DAC has started replaying old
+// buffers. Do not try to make up the lost time; resume as if one frame late.
+static constexpr int64_t TX_PLAYOUT_STALE_SAMPLES_48K = TX_DMA_RING_SAMPLES_48K - TX_DMA_BUFFER_SAMPLES_48K;
+static constexpr int64_t TX_PLAYOUT_RESYNC_DEFICIT_48K = TX_PLAYOUT_WRITE_DEFICIT_48K + AUDIO_FRAME_SAMPLES_48K;
+static_assert(TX_PLAYOUT_RESYNC_DEFICIT_48K < TX_PLAYOUT_STALE_SAMPLES_48K, "resync point must be below the stale point");
+// Time for the last written frame to leave the DMA ring, plus margin.
+static constexpr uint32_t TX_PLAYOUT_FLUSH_US =
+    (uint32_t)(TX_DMA_RING_SAMPLES_48K * 1000000LL / AUDIO_SAMPLE_RATE) + 6000;
+// Upper bound on how long PTT release waits for buffered audio to play out.
+static constexpr uint32_t TX_DRAIN_MAX_MS = 1500;
+// Credit kept free for control frames (PTT release, state) when deciding that
+// the host is out of window and playout must start.
+static constexpr size_t TX_CREDIT_RESERVE_BYTES = 512;
+// Sized for one BLE window (4096 B of KISS frames carry less than 4096 B of
+// audio payload), so a single host that honours flow control can never
+// overflow it. Static DRAM is tight on this build (BT enabled), so this is
+// deliberately not larger; if it does fill, the oldest frame is played early.
+static constexpr size_t TX_JITTER_CAPACITY_BYTES = 4096;
+static constexpr size_t TX_JITTER_CAPACITY_ENTRIES = 64;
+
+// Counts PCM bytes on their way to I2S, so playout can be paced against the
+// clock without querying (or blocking on) the DMA.
+class CountingPrint : public Print {
+public:
+  explicit CountingPrint(Print &target) : target(target) {}
+  size_t write(uint8_t b) override {
+    bytes++;
+    return target.write(b);
+  }
+  size_t write(const uint8_t *data, size_t len) override {
+    bytes += len;
+    return target.write(data, len);
+  }
+  uint64_t bytes = 0;
+private:
+  Print &target;
+};
 
 bool txStreamConfigured = false;
 bool txDecodeStreamStarted = false;
 I2SStream out;
 AudioInfo txInfo(AUDIO_SAMPLE_RATE, 1, 16);
 AudioInfo txAudioInfo(AUDIO_WIRE_SAMPLE_RATE, 1, 16);
-AudioUpsampleOutput txUpsample(out);
+CountingPrint txOutCounter(out);
+AudioUpsampleOutput txUpsample(txOutCounter);
 VolumeMeter txVolumeMeter(txUpsample);
 ADPCMDecoder txAdpcmDecoder(AV_CODEC_ID_ADPCM_IMA_WAV, AUDIO_FRAME_BYTES);
 EncodedAudioStream txDecodeStream(&txVolumeMeter, &txAdpcmDecoder);
@@ -102,6 +160,56 @@ static void onFreeDvTxSamples(const int16_t *samples, size_t count) {
 FreeDv2400bModulator freeDvTx(onFreeDvTxSamples);
 int16_t freeDvTxScratch[256];
 
+TxJitterBuffer<TX_JITTER_CAPACITY_BYTES, TX_JITTER_CAPACITY_ENTRIES> txJitter(
+    AUDIO_WIRE_SAMPLE_RATE, AUDIO_FRAME_SAMPLES_WIRE, AUDIO_FRAME_BYTES);
+static const uint8_t txSilenceChunk[AUDIO_FRAME_SAMPLES_WIRE * sizeof(int16_t) / 6] = {};
+static_assert((AUDIO_FRAME_SAMPLES_WIRE * sizeof(int16_t)) % sizeof(txSilenceChunk) == 0,
+              "silence chunk must divide one wire frame");
+
+struct TxPlayoutStats {
+  bool active = false;
+  bool prerollChosen = false;
+  uint32_t startMs = 0;
+  uint32_t endMs = 0;
+  uint32_t leadSilenceSamplesWire = 0;  // Silence before the first audio (pre-roll).
+  uint32_t gapSilenceSamplesWire = 0;   // Silence filling underruns mid-transmission.
+  uint32_t lateTicks = 0;           // The main loop fell behind the DAC (DMA ran dry).
+  uint32_t creditsReturnedAtEnd = 0;
+  uint32_t framesDiscardedAtEnd = 0;
+  uint32_t drainMs = 0;
+  bool releasePending = false;
+  uint32_t releaseStartMs = 0;
+  const ProtocolSession *lastSession = nullptr;
+  int64_t anchorUs = 0;
+  uint64_t anchorBytes = 0;
+  int64_t deficitAdjust = 0;
+  int64_t lastAudioWriteUs = 0;
+  bool audioWritten = false;
+};
+TxPlayoutStats txPlayout;
+
+static void txReturnCredit(const TxJitterBuffer<TX_JITTER_CAPACITY_BYTES, TX_JITTER_CAPACITY_ENTRIES>::Entry &meta) {
+  const ProtocolSession *session = static_cast<const ProtocolSession *>(meta.ackTag);
+  if (session != nullptr && meta.ackBytes > 0 && protocolSessionConnected(*session)) {
+    sendWindowAck(*session->stream, meta.ackBytes);
+  }
+}
+
+// Samples the DAC has consumed since keying minus samples we have written: how
+// far behind the writer is. Kept between one DMA buffer and one frame more
+// than that in steady state.
+static int64_t txPlayoutDeficitSamples() {
+  int64_t written = (int64_t)((txOutCounter.bytes - txPlayout.anchorBytes) / sizeof(int16_t));
+  int64_t elapsed = (esp_timer_get_time() - txPlayout.anchorUs) * AUDIO_SAMPLE_RATE / 1000000;
+  return elapsed - written + txPlayout.deficitAdjust;
+}
+
+// True while the last audio frame written may still be in the DMA ring.
+static bool txPlayoutAudioInFlight() {
+  return txPlayout.audioWritten
+    && (esp_timer_get_time() - txPlayout.lastAudioWriteUs) < (int64_t)TX_PLAYOUT_FLUSH_US;
+}
+
 void initI2STx() {  
   freeDvTx.setMagnitude(16383);
   auto config = out.defaultConfig(TX_MODE);
@@ -140,14 +248,175 @@ void endI2STx() {
   txStreamConfigured = false;
 }
 
-void processTxAudio(uint8_t *src, size_t len) {
+static void txDecode(const uint8_t *src, size_t len) {
+  txDecodeStream.write(src, len);
+}
+
+static void txAfterAudioWrite() {
+  updateTxAudioLevel(txVolumeMeter.volumeRatio());
+  txPlayout.lastAudioWriteUs = esp_timer_get_time();
+  txPlayout.audioWritten = true;
+}
+
+static void txPlayFrame(const uint8_t *src, size_t len) {
+  txDecode(src, len);
+  txAfterAudioWrite();
+}
+
+static void txPlayOldest() {
+  TxJitterBuffer<TX_JITTER_CAPACITY_BYTES, TX_JITTER_CAPACITY_ENTRIES>::Entry meta;
+  if (txJitter.pop(txDecode, meta) > 0) {
+    txAfterAudioWrite();
+    txReturnCredit(meta);
+  }
+}
+
+// One wire frame (249 samples) of silence through the upsampler.
+static void txWriteSilenceFrame() {
+  for (size_t i = 0; i < AUDIO_FRAME_SAMPLES_WIRE * sizeof(int16_t); i += sizeof(txSilenceChunk)) {
+    txUpsample.write(txSilenceChunk, sizeof(txSilenceChunk));
+  }
+}
+
+// Called when entering MODE_TX.
+void txPlayoutBegin() {
+  uint32_t now = millis();
+  txJitter.reset(now, TX_PREROLL_WIRELESS_MS);
+  txPlayout = TxPlayoutStats{};
+  txPlayout.active = true;
+  txPlayout.startMs = now;
+  txPlayout.anchorUs = esp_timer_get_time();
+  txPlayout.anchorBytes = txOutCounter.bytes;
+}
+
+// Called when leaving MODE_TX. Anything still buffered is discarded, but its
+// flow-control credit is returned so the host's window is not lost.
+void txPlayoutEnd() {
+  if (!txPlayout.active) {
+    return;
+  }
+  TxJitterBuffer<TX_JITTER_CAPACITY_BYTES, TX_JITTER_CAPACITY_ENTRIES>::Entry meta;
+  while (!txJitter.empty()) {
+    txJitter.discard(meta);
+    txPlayout.framesDiscardedAtEnd++;
+    if (meta.ackBytes > 0) {
+      txPlayout.creditsReturnedAtEnd += meta.ackBytes;
+    }
+    txReturnCredit(meta);
+  }
+  if (txPlayout.releasePending) {
+    txPlayout.drainMs = millis() - txPlayout.releaseStartMs;
+  }
+  txPlayout.releasePending = false;
+  txPlayout.active = false;
+  txPlayout.endMs = millis();
+}
+
+// A host session went away: keep its queued audio but drop its credits.
+void txPlayoutForgetSession(const ProtocolSession &session) {
+  txJitter.forgetAckTag(&session);
+  if (txPlayout.lastSession == &session) {
+    txPlayout.lastSession = nullptr;
+  }
+}
+
+// PTT was released while audio is still buffered: keep the carrier until it
+// has played. Returns true if the caller should keep transmitting for now.
+bool txPlayoutRequestDrain() {
+  if (!txPlayout.active || freeDv2400bEnabled()) {
+    return false;
+  }
+  if (txJitter.empty() && !txPlayoutAudioInFlight()) {
+    return false;
+  }
+  if (!txPlayout.releasePending) {
+    txPlayout.releasePending = true;
+    txPlayout.releaseStartMs = millis();
+  }
+  return true;
+}
+
+void txPlayoutCancelDrain() {
+  txPlayout.releasePending = false;
+}
+
+void processTxAudio(ProtocolSession &session, uint8_t *src, size_t len) {
   if (!src || len == 0 || !txStreamConfigured) {
     return;
   }
-  txWatchDog.onFrame(millis());
-  txDecodeStream.write(src, len);
-  updateTxAudioLevel(txVolumeMeter.volumeRatio());
+  uint32_t now = millis();
+  txWatchDog.onFrame(now);
+  if (!txPlayout.prerollChosen) {
+    txJitter.setPrerollMs(&session == &protocolUsbSession ? TX_PREROLL_USB_MS : TX_PREROLL_WIRELESS_MS);
+    txPlayout.prerollChosen = true;
+  }
+  txPlayout.lastSession = &session;
+  uint32_t ack = protocolClaimFrameAck(session);
+  while (!txJitter.push(src, len, &session, (uint16_t)ack, now)) {
+    if (txJitter.empty()) {
+      // Larger than the whole buffer: play it directly, as before buffering existed.
+      txPlayFrame(src, len);
+      if (ack > 0 && protocolSessionConnected(session)) {
+        sendWindowAck(*session.stream, ack);
+      }
+      break;
+    }
+    // The host sent more than its window. Play the oldest frame early
+    // (blocking on I2S if needed) rather than dropping audio: dropping part of
+    // the ADPCM byte stream would misalign every block after it.
+    txPlayOldest();
+  }
   esp_task_wdt_reset();
+}
+
+// Feed the DAC: one call per loop iteration while keyed for voice.
+void txPlayoutLoop() {
+  if (!txPlayout.active || !txStreamConfigured || freeDv2400bEnabled()) {
+    return;
+  }
+  int64_t deficit = txPlayoutDeficitSamples();
+  if (deficit > TX_PLAYOUT_STALE_SAMPLES_48K) {
+    // The loop was blocked long enough for the DAC to replay old DMA buffers.
+    txPlayout.lateTicks++;
+    txPlayout.deficitAdjust -= deficit - TX_PLAYOUT_RESYNC_DEFICIT_48K;
+    deficit = TX_PLAYOUT_RESYNC_DEFICIT_48K;
+  }
+  uint32_t now = millis();
+  bool creditPressure = false;
+  if (txPlayout.lastSession != nullptr && txPlayout.lastSession->windowSize > TX_CREDIT_RESERVE_BYTES) {
+    creditPressure = txJitter.heldAckBytes() + TX_CREDIT_RESERVE_BYTES >= txPlayout.lastSession->windowSize;
+  }
+  // A few frames at most per call, so catching up never stalls the main loop.
+  for (int i = 0; i < 4 && deficit >= TX_PLAYOUT_WRITE_DEFICIT_48K; i++) {
+    if (txJitter.shouldPlay(now, creditPressure, txPlayout.releasePending)) {
+      txPlayOldest();
+    } else {
+      // Explicit silence: with auto_clear off the DMA would otherwise loop
+      // over its last buffers, which is the stutter this buffer exists to fix.
+      // While draining after PTT release this is just the tail, not an underrun.
+      txWriteSilenceFrame();
+      if (!txPlayout.releasePending) {
+        txJitter.noteEmptySlot();
+        if (txJitter.stats().prerollReached) {
+          txPlayout.gapSilenceSamplesWire += AUDIO_FRAME_SAMPLES_WIRE;
+        } else {
+          txPlayout.leadSilenceSamplesWire += AUDIO_FRAME_SAMPLES_WIRE;
+        }
+      }
+    }
+    deficit = txPlayoutDeficitSamples();
+  }
+}
+
+// True once a pending PTT release has played out (or waited too long).
+bool txPlayoutDrainComplete() {
+  if (!txPlayout.releasePending) {
+    return false;
+  }
+  if ((uint32_t)(millis() - txPlayout.releaseStartMs) >= TX_DRAIN_MAX_MS) {
+    return true;
+  }
+  return txJitter.empty() && !txPlayoutAudioInFlight();
 }
 
 void processTxAx25(const uint8_t *src, size_t len, float txDelayMs, float txTailMs) {
@@ -183,6 +452,13 @@ void releaseHostPtt() {
 
 void inline txAudioLoop() {
   if (mode == MODE_TX) {
+    if (txPlayoutDrainComplete()) {
+      setMode(rxIdleMode());
+      markDeviceStateDirty();
+      esp_task_wdt_reset();
+      return;
+    }
+    txPlayoutLoop();
     if ((desiredState.flags & HOST_STATE_PTT_REQUESTED) && txWatchDog.expired(millis())) {
       _LOGW("TX audio timeout; releasing host PTT");
       releaseHostPtt();

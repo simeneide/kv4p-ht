@@ -289,6 +289,8 @@ void drainRadioSerial() {
 
 void reconcileDesiredState(bool sendReport = true) {
   lastDeviceStateError = DEVICE_STATE_ERROR_NONE;
+  // Never keep transmitting buffered audio on a channel that is being retuned.
+  bool retuning = (desiredState.flags & HOST_STATE_RADIO_CONFIG_VALID) && radioConfigChanged();
   bool wantHigh = desiredState.flags & HOST_STATE_HIGH_POWER;
   if (hw.features.hasHL) {
     digitalWrite(hw.pins.pinHl, wantHigh ? LOW : HIGH);
@@ -331,7 +333,11 @@ void reconcileDesiredState(bool sendReport = true) {
   }
 
   if ((desiredState.flags & HOST_STATE_PTT_REQUESTED) && txAllowedByHost()) {
+    txPlayoutCancelDrain();
     setMode(MODE_TX);
+  } else if (mode == MODE_TX && txAllowedByHost() && !retuning && txPlayoutRequestDrain()) {
+    // PTT released with voice still buffered: stay keyed until it has been
+    // played; txAudioLoop() switches to RX when the buffer is empty.
   } else {
     setMode(rxIdleMode());
   }
@@ -347,6 +353,10 @@ void setMode(Mode newMode) {
   }
   freeDvRx.reset();
   freeDvTx.reset();
+  if (mode == MODE_TX) {
+    txPlayoutEnd();
+    logTxSummary();
+  }
   mode = newMode;
   markDeviceStateDirty();
   switch (mode) {
@@ -369,6 +379,8 @@ void setMode(Mode newMode) {
       digitalWrite(hw.pins.pinPtt, LOW);
       endI2SRx();
       initI2STx();
+      txPlayoutBegin();
+      bleKissStream.resetRxGapStats();
       if (protocolHasBleSession() && bleKissStream.requestConnParamsIfNeeded()) {
         debug_log_printf(COMMAND_DEBUG_INFO, "BLE link: re-requested %u-%u x1.25 ms, latency 0 for TX",
                          bleKissConfig().connMinInterval, bleKissConfig().connMaxInterval);
@@ -386,6 +398,32 @@ void logBleLinkInfo(const char *prefix) {
                    link.connLatency, link.connTimeout * 10, link.lastParamStatus, link.connParamRequests,
                    link.mtu, link.txOctets, link.rxOctets, link.lastDataLenStatus,
                    link.dataLenReported ? "" : " (dle not reported)");
+}
+
+// One line per transmission, always on (also in release builds), so TX audio
+// starvation can be judged from logs alone without listening to the air.
+void logTxSummary() {
+  const auto &js = txJitter.stats();
+  uint32_t keyedMs = txPlayout.endMs - txPlayout.startMs;
+  uint32_t audioMs = (uint32_t)((uint64_t)js.framesOut * AUDIO_FRAME_SAMPLES_WIRE * 1000 / AUDIO_WIRE_SAMPLE_RATE);
+  Kv4pBleKissStream::LinkInfo link = bleKissStream.linkInfo();
+  debug_log_printf(COMMAND_DEBUG_INFO,
+                   "TX summary: keyed=%lu ms frames_in=%lu bytes_in=%lu played=%lu (~%lu ms) preroll=%lu ms "
+                   "reached=%s@%lu ms underruns=%lu gap_silence=%lu ms lead_silence=%lu ms max_frame_gap=%lu ms "
+                   "max_ble_write_gap=%lu ms peak=%lu B (%lu ms) overflows=%lu late=%lu discarded=%lu drain=%lu ms "
+                   "ble=%s interval=%u.%02u ms latency=%u mtu=%u dle=%u/%u heap=%u min=%u",
+                   (unsigned long)keyedMs, (unsigned long)js.framesIn, (unsigned long)js.bytesIn,
+                   (unsigned long)js.framesOut, (unsigned long)audioMs, (unsigned long)txJitter.prerollMs(),
+                   js.prerollReached ? "yes" : "no", (unsigned long)js.prerollReachedMs, (unsigned long)js.underruns,
+                   (unsigned long)(txPlayout.gapSilenceSamplesWire * 1000UL / AUDIO_WIRE_SAMPLE_RATE),
+                   (unsigned long)(txPlayout.leadSilenceSamplesWire * 1000UL / AUDIO_WIRE_SAMPLE_RATE),
+                   (unsigned long)js.maxArrivalGapMs, (unsigned long)bleKissStream.rxMaxGapMs(),
+                   (unsigned long)js.peakBytes, (unsigned long)txJitter.bytesToMs(js.peakBytes),
+                   (unsigned long)js.overflows, (unsigned long)txPlayout.lateTicks,
+                   (unsigned long)txPlayout.framesDiscardedAtEnd, (unsigned long)txPlayout.drainMs,
+                   protocolHasBleSession() ? "yes" : "no", (link.connInterval * 125) / 100,
+                   (link.connInterval * 125) % 100, link.connLatency, link.mtu, link.txOctets, link.rxOctets,
+                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
 }
 
 void setup() {
@@ -484,7 +522,7 @@ void handleCommands(ProtocolSession &session, RcvCommand command, uint8_t *param
   switch (command) {
     case COMMAND_HOST_TX_AUDIO:
       if (mode == MODE_TX && !freeDv2400bEnabled()) {
-        processTxAudio(params, param_len);
+        processTxAudio(session, params, param_len);
         esp_task_wdt_reset();
       }
       break;
@@ -709,6 +747,7 @@ void bluetoothLoop() {
   } else if (!connected && bluetoothProtocolConnected) {
     bluetoothProtocolConnected = false;
     protocolBtSession.connected = false;
+    txPlayoutForgetSession(protocolBtSession);
     uint16_t oldSessionFlags = protocolBtSession.flags;
     protocolBtSession.flags = 0;
     bluetoothParser.reset();
@@ -737,6 +776,7 @@ void bleKissLoop() {
   } else if ((!connected || !protocolReady) && bleKissProtocolConnected) {
     bleKissProtocolConnected = false;
     protocolBleSession.connected = false;
+    txPlayoutForgetSession(protocolBleSession);
     uint16_t oldSessionFlags = protocolBleSession.flags;
     protocolBleSession.flags = 0;
     bleKissParser.reset();
