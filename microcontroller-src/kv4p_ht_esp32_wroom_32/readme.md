@@ -12,7 +12,7 @@ The KV4P-HT protocol defines the communication interface between the microcontro
 * Added FreeDV 2400B digital voice negotiation with `FEATURE_HAS_FREEDV_2400B` and `HOST_STATE_FREEDV_2400B`. When enabled, 7-byte Codec2 1300 frames use `COMMAND_HOST_TX_DIGITAL` and `COMMAND_RX_DIGITAL` (`0x0E`) instead of ADPCM audio.
 * Added standard KISS `TXDELAY`, `PERSIST`, and `SLOTTIME` controls. Firmware performs CSMA/p-persistence channel access and queues up to two outbound AX.25 KISS DATA frames.
 * Added `COMMAND_HOST_TX_AX25` (`0x0F`) for AX.25 transmission with a temporary TX frequency, bandwidth, and CTCSS configuration.
-* `COMMAND_HOST_TX_AUDIO` frames are buffered before playout (about 300 ms over Bluetooth, 40 ms over USB) and their `COMMAND_WINDOW_UPDATE` credit is returned when the audio is played, not when it is received. Releasing PTT keeps the transmitter keyed until buffered audio has played. Wire format unchanged. See `../docs/ble-robustness.md`.
+* `COMMAND_HOST_TX_AUDIO` frames are buffered before playout (about 300 ms over Bluetooth, 40 ms over USB) and their `COMMAND_WINDOW_UPDATE` credit is returned when the audio is played, not when it is received. Releasing PTT keeps the transmitter keyed until buffered audio has played. Firmware advertises this with `FEATURE_HAS_TX_JITTER_BUFFER`. Wire format unchanged. See `../docs/ble-robustness.md`.
 * After `COMMAND_HELLO`, firmware sends the reset reason (and a core dump summary, if one is stored) as `COMMAND_DEBUG_INFO` text, and one `COMMAND_DEBUG_INFO` summary line at the end of each transmission. Hosts may ignore these like any other debug frame.
 
 ### v2.0.0.0 (FW: 17)
@@ -163,6 +163,7 @@ typedef struct version Version;
 #define FEATURE_HAS_PHY_PTT (1 << 1)
 #define FEATURE_HAS_ESP32_AFSK (1 << 2)
 #define FEATURE_HAS_FREEDV_2400B (1 << 3)
+#define FEATURE_HAS_TX_JITTER_BUFFER (1 << 4)
 
 struct hello {
   Version     version;

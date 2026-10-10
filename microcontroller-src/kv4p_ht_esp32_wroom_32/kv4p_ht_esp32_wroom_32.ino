@@ -183,7 +183,8 @@ uint8_t getFirmwareFeatures() {
   return (hw.features.hasHL ? FEATURE_HAS_HL : 0)
     | (hw.features.hasPhysPTT ? FEATURE_HAS_PHY_PTT : 0)
     | FEATURE_HAS_ESP32_AFSK
-    | FEATURE_HAS_FREEDV_2400B;
+    | FEATURE_HAS_FREEDV_2400B
+    | FEATURE_HAS_TX_JITTER_BUFFER;
 }
 
 Mode rxIdleMode() {

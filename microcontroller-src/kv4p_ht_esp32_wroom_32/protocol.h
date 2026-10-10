@@ -80,6 +80,9 @@ REQUIRE_TRIVIALLY_COPYABLE(Version);
 #define FEATURE_HAS_PHY_PTT (1 << 1)
 #define FEATURE_HAS_ESP32_AFSK (1 << 2)
 #define FEATURE_HAS_FREEDV_2400B (1 << 3)
+// TX audio is buffered before playout and its window credit is returned as it
+// plays; PTT release keeps the transmitter keyed until buffered audio is out.
+#define FEATURE_HAS_TX_JITTER_BUFFER (1 << 4)
 
 #define HOST_STATE_RADIO_CONFIG_VALID (1 << 0)
 #define HOST_STATE_PTT_REQUESTED      (1 << 1)
