@@ -22,6 +22,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <vector>
 
 #include "txJitterBuffer.h"
+#include "txKeyPolicy.h"
 
 // 16 kHz IMA ADPCM: one 128-byte block is 249 samples, ~15.56 ms.
 using Buffer = TxJitterBuffer<1024, 16>;
@@ -206,6 +207,102 @@ void test_reset_clears_state() {
   TEST_ASSERT_EQUAL_UINT32(0, b.stats().framesIn);
 }
 
+// --- PTT release drain ---
+
+static TxReconcileInput keyedDraining() {
+  // Keyed, PTT just released, voice still buffered.
+  return {.keyed = true, .pttRequested = false, .txAllowed = true,
+          .retuning = false, .refiltering = false, .drainPossible = true};
+}
+
+void test_policy_ptt_release_starts_drain() {
+  TxReconcilePlan plan = planTxReconcile(keyedDraining());
+  TEST_ASSERT_FALSE(plan.unkeyFirst);
+  TEST_ASSERT_FALSE(plan.applyFilters);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Drain);
+}
+
+void test_policy_filter_change_during_drain_is_deferred() {
+  // pgpilot's second write: pre-emphasis off while the first one drains.
+  TxReconcileInput in = keyedDraining();
+  in.refiltering = true;
+  TxReconcilePlan plan = planTxReconcile(in);
+  TEST_ASSERT_FALSE(plan.unkeyFirst);
+  TEST_ASSERT_FALSE(plan.applyFilters);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Drain);
+
+  // Drain done, unkeyed: the next pass applies it.
+  TxReconcileInput after = {.keyed = false, .pttRequested = false, .txAllowed = true,
+                            .retuning = false, .refiltering = true, .drainPossible = false};
+  plan = planTxReconcile(after);
+  TEST_ASSERT_TRUE(plan.applyFilters);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Idle);
+}
+
+void test_policy_filter_change_with_nothing_to_drain_unkeys_first() {
+  TxReconcileInput in = keyedDraining();
+  in.refiltering = true;
+  in.drainPossible = false;
+  TxReconcilePlan plan = planTxReconcile(in);
+  TEST_ASSERT_TRUE(plan.unkeyFirst);
+  TEST_ASSERT_TRUE(plan.applyFilters);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Idle);
+}
+
+void test_policy_retune_during_drain_unkeys_at_once() {
+  TxReconcileInput in = keyedDraining();
+  in.retuning = true;
+  TxReconcilePlan plan = planTxReconcile(in);
+  TEST_ASSERT_TRUE(plan.unkeyFirst);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Idle);
+  in.refiltering = true;
+  plan = planTxReconcile(in);
+  TEST_ASSERT_TRUE(plan.unkeyFirst);
+  TEST_ASSERT_TRUE(plan.applyFilters);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Idle);
+}
+
+void test_policy_tx_disallowed_during_drain_unkeys_at_once() {
+  TxReconcileInput in = keyedDraining();
+  in.txAllowed = false;
+  TxReconcilePlan plan = planTxReconcile(in);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Idle);
+  in.refiltering = true;
+  plan = planTxReconcile(in);
+  TEST_ASSERT_TRUE(plan.unkeyFirst);
+  TEST_ASSERT_TRUE(plan.applyFilters);
+}
+
+void test_policy_repress_during_drain_keeps_keyed() {
+  // Emphasis back on (the deferred change cancelled out), then PTT again.
+  TxReconcileInput in = keyedDraining();
+  TxReconcilePlan plan = planTxReconcile(in);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Drain);
+  in.pttRequested = true;
+  plan = planTxReconcile(in);
+  TEST_ASSERT_FALSE(plan.unkeyFirst);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Key);
+  // Re-press while a filter change is still pending: stays keyed and applies
+  // it as a keyed change, as upstream always has.
+  in.refiltering = true;
+  plan = planTxReconcile(in);
+  TEST_ASSERT_FALSE(plan.unkeyFirst);
+  TEST_ASSERT_TRUE(plan.applyFilters);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Key);
+}
+
+void test_policy_key_from_idle_applies_config_first() {
+  TxReconcileInput in = {.keyed = false, .pttRequested = true, .txAllowed = true,
+                         .retuning = true, .refiltering = true, .drainPossible = false};
+  TxReconcilePlan plan = planTxReconcile(in);
+  TEST_ASSERT_FALSE(plan.unkeyFirst);
+  TEST_ASSERT_TRUE(plan.applyFilters);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Key);
+  in.txAllowed = false;
+  plan = planTxReconcile(in);
+  TEST_ASSERT_TRUE(plan.end == TxReconcileEnd::Idle);
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_buffered_ms_counts_adpcm_blocks);
@@ -221,5 +318,12 @@ int main(int, char **) {
   RUN_TEST(test_held_credit_is_tracked_per_session);
   RUN_TEST(test_arrival_gap_and_peak_are_tracked);
   RUN_TEST(test_reset_clears_state);
+  RUN_TEST(test_policy_ptt_release_starts_drain);
+  RUN_TEST(test_policy_filter_change_during_drain_is_deferred);
+  RUN_TEST(test_policy_filter_change_with_nothing_to_drain_unkeys_first);
+  RUN_TEST(test_policy_retune_during_drain_unkeys_at_once);
+  RUN_TEST(test_policy_tx_disallowed_during_drain_unkeys_at_once);
+  RUN_TEST(test_policy_repress_during_drain_keeps_keyed);
+  RUN_TEST(test_policy_key_from_idle_applies_config_first);
   return UNITY_END();
 }

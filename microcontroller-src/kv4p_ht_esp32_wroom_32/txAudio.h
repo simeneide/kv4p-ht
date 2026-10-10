@@ -372,13 +372,19 @@ void txPlayoutForgetSession(const ProtocolSession &session) {
   }
 }
 
+// True while analog voice is still buffered or in the DMA ring, i.e. a PTT
+// release would keep the carrier to play it out.
+bool txPlayoutCanDrain() {
+  if (!txPlayout.active || !txPlayout.hostVoice || freeDv2400bEnabled()) {
+    return false;
+  }
+  return !txJitter.empty() || txPlayoutAudioInFlight();
+}
+
 // PTT was released while audio is still buffered: keep the carrier until it
 // has played. Returns true if the caller should keep transmitting for now.
 bool txPlayoutRequestDrain() {
-  if (!txPlayout.active || freeDv2400bEnabled()) {
-    return false;
-  }
-  if (txJitter.empty() && !txPlayoutAudioInFlight()) {
+  if (!txPlayoutCanDrain()) {
     return false;
   }
   if (!txPlayout.releasePending) {
@@ -516,6 +522,7 @@ void releaseHostPtt() {
     desiredState.sequence++;
   }
   setMode(rxIdleMode());
+  applyDeferredFilters();
   markDeviceStateDirty();
 }
 
@@ -523,6 +530,8 @@ void inline txAudioLoop() {
   if (mode == MODE_TX) {
     if (txPlayoutDrainComplete()) {
       setMode(rxIdleMode());
+      // A filter or emphasis change that arrived during the drain.
+      applyDeferredFilters();
       markDeviceStateDirty();
       esp_task_wdt_reset();
       return;

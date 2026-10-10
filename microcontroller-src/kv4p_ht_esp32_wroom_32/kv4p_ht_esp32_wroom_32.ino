@@ -29,6 +29,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "protocol.h"
 #include "state.h"
 #include "rxAudio.h"
+#include "txKeyPolicy.h"
 #include "txAudio.h"
 #include "ax25TxScheduler.h"
 #include "buttons.h"
@@ -288,15 +289,46 @@ void drainRadioSerial() {
   }
 }
 
+uint16_t appliedFilterFlags() {
+  return appliedState.flags & (HOST_STATE_FILTER_PRE | HOST_STATE_FILTER_HIGH | HOST_STATE_FILTER_LOW);
+}
+
+void applyFilterFlags() {
+  uint16_t filterFlags = desiredFilterFlags();
+  drainRadioSerial();
+  while (!sa818.filters((filterFlags & HOST_STATE_FILTER_PRE), false, false)) {
+    lastDeviceStateError = DEVICE_STATE_ERROR_FILTERS_FAILED;
+    esp_task_wdt_reset();
+  }
+  rxDownsample.setFilters((filterFlags & HOST_STATE_FILTER_HIGH) != 0,
+                          (filterFlags & HOST_STATE_FILTER_LOW) != 0);
+  appliedState.flags = (appliedState.flags & ~(HOST_STATE_FILTER_PRE | HOST_STATE_FILTER_HIGH | HOST_STATE_FILTER_LOW)) | filterFlags;
+  filtersApplied = true;
+}
+
+// A filter change that waited for a PTT-release drain: apply it now that the
+// carrier is down. Called from every path that unkeys outside
+// reconcileDesiredState() (drain complete, TX watchdog, runaway timer).
+void applyDeferredFilters() {
+  if (mode != MODE_TX && filtersApplied && desiredFilterFlags() != appliedFilterFlags()) {
+    applyFilterFlags();
+    markDeviceStateDirty();
+  }
+}
+
 void reconcileDesiredState(bool sendReport = true) {
   lastDeviceStateError = DEVICE_STATE_ERROR_NONE;
-  // A PTT release would normally let buffered audio drain while keyed, but
-  // never retune or refilter the SA818 under a live carrier: unkey first.
-  bool keepKeyed = (desiredState.flags & HOST_STATE_PTT_REQUESTED) && txAllowedByHost();
-  bool retuning = (desiredState.flags & HOST_STATE_RADIO_CONFIG_VALID) && radioConfigChanged();
-  bool refiltering = !filtersApplied
-    || desiredFilterFlags() != (appliedState.flags & (HOST_STATE_FILTER_PRE | HOST_STATE_FILTER_HIGH | HOST_STATE_FILTER_LOW));
-  if (mode == MODE_TX && !keepKeyed && (retuning || refiltering)) {
+  // See txKeyPolicy.h: a PTT release drains buffered voice while keyed, a
+  // filter change during that drain waits for it, and a retune unkeys first.
+  TxReconcilePlan plan = planTxReconcile({
+    .keyed = mode == MODE_TX,
+    .pttRequested = (desiredState.flags & HOST_STATE_PTT_REQUESTED) != 0,
+    .txAllowed = txAllowedByHost(),
+    .retuning = (desiredState.flags & HOST_STATE_RADIO_CONFIG_VALID) && radioConfigChanged(),
+    .refiltering = !filtersApplied || desiredFilterFlags() != appliedFilterFlags(),
+    .drainPossible = txPlayoutCanDrain(),
+  });
+  if (plan.unkeyFirst) {
     setMode(rxIdleMode());
   }
   bool wantHigh = desiredState.flags & HOST_STATE_HIGH_POWER;
@@ -305,18 +337,8 @@ void reconcileDesiredState(bool sendReport = true) {
   }
   rssiOn = desiredState.flags & HOST_STATE_RSSI_ENABLED;
 
-  uint16_t filterFlags = desiredFilterFlags();
-  uint16_t appliedFilterFlags = appliedState.flags & (HOST_STATE_FILTER_PRE | HOST_STATE_FILTER_HIGH | HOST_STATE_FILTER_LOW);
-  if (!filtersApplied || filterFlags != appliedFilterFlags) {
-    drainRadioSerial();
-    while (!sa818.filters((filterFlags & HOST_STATE_FILTER_PRE), false, false)) {
-      lastDeviceStateError = DEVICE_STATE_ERROR_FILTERS_FAILED;
-      esp_task_wdt_reset();
-    }
-    rxDownsample.setFilters((filterFlags & HOST_STATE_FILTER_HIGH) != 0,
-                            (filterFlags & HOST_STATE_FILTER_LOW) != 0);
-    appliedState.flags = (appliedState.flags & ~(HOST_STATE_FILTER_PRE | HOST_STATE_FILTER_HIGH | HOST_STATE_FILTER_LOW)) | filterFlags;
-    filtersApplied = true;
+  if (plan.applyFilters) {
+    applyFilterFlags();
   }
 
   if ((desiredState.flags & HOST_STATE_RADIO_CONFIG_VALID) && radioConfigChanged()) {
@@ -340,14 +362,23 @@ void reconcileDesiredState(bool sendReport = true) {
     radioConfigApplied = true;
   }
 
-  if ((desiredState.flags & HOST_STATE_PTT_REQUESTED) && txAllowedByHost()) {
-    txPlayoutCancelDrain();
-    setMode(MODE_TX);
-  } else if (mode == MODE_TX && txAllowedByHost() && txPlayoutRequestDrain()) {
-    // PTT released with voice still buffered: stay keyed until it has been
-    // played; txAudioLoop() switches to RX when the buffer is empty.
-  } else {
-    setMode(rxIdleMode());
+  switch (plan.end) {
+    case TxReconcileEnd::Key:
+      // A re-press while draining continues the same over.
+      txPlayoutCancelDrain();
+      setMode(MODE_TX);
+      break;
+    case TxReconcileEnd::Drain:
+      // PTT released with voice still buffered: stay keyed until it has been
+      // played; txAudioLoop() unkeys when the buffer is empty and then applies
+      // any filter change that arrived meanwhile.
+      txPlayoutRequestDrain();
+      break;
+    case TxReconcileEnd::Idle:
+      setMode(rxIdleMode());
+      // A change deferred by an earlier drain pass, now that we are unkeyed.
+      applyDeferredFilters();
+      break;
   }
   savePersistedRadioStateIfChanged();
   if (sendReport) {

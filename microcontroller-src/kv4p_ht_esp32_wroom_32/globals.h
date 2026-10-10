@@ -116,6 +116,7 @@ Mode rxIdleMode();
 void sendCurrentDeviceState();
 void markDeviceStateDirty();
 bool freeDv2400bEnabled();
+void applyDeferredFilters();
 
 struct [[gnu::packed]] RGBColor {
   uint8_t red;
