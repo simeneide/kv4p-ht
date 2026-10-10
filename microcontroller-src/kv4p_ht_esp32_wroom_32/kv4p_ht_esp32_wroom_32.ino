@@ -369,8 +369,23 @@ void setMode(Mode newMode) {
       digitalWrite(hw.pins.pinPtt, LOW);
       endI2SRx();
       initI2STx();
+      if (protocolHasBleSession() && bleKissStream.requestConnParamsIfNeeded()) {
+        debug_log_printf(COMMAND_DEBUG_INFO, "BLE link: re-requested %u-%u x1.25 ms, latency 0 for TX",
+                         bleKissConfig().connMinInterval, bleKissConfig().connMaxInterval);
+      }
     break;
   }
+}
+
+void logBleLinkInfo(const char *prefix) {
+  Kv4pBleKissStream::LinkInfo link = bleKissStream.linkInfo();
+  debug_log_printf(COMMAND_DEBUG_INFO,
+                   "%s: connected=%u interval=%u.%02u ms latency=%u timeout=%u ms param_status=%u requests=%u "
+                   "mtu=%u dle_tx=%u dle_rx=%u dle_status=%u%s",
+                   prefix, link.connected ? 1 : 0, (link.connInterval * 125) / 100, (link.connInterval * 125) % 100,
+                   link.connLatency, link.connTimeout * 10, link.lastParamStatus, link.connParamRequests,
+                   link.mtu, link.txOctets, link.rxOctets, link.lastDataLenStatus,
+                   link.dataLenReported ? "" : " (dle not reported)");
 }
 
 void setup() {
@@ -732,6 +747,15 @@ void bleKissLoop() {
 
   if (bleKissProtocolConnected) {
     bleKissParser.loop();
+  }
+
+  // Log every change of connection parameters, MTU or data length. The values
+  // are recorded on the Bluetooth task and only logged here, on the main loop.
+  static uint32_t loggedLinkGeneration = 0;
+  Kv4pBleKissStream::LinkInfo link = bleKissStream.linkInfo();
+  if (link.generation != loggedLinkGeneration) {
+    loggedLinkGeneration = link.generation;
+    logBleLinkInfo("BLE link");
   }
 }
 

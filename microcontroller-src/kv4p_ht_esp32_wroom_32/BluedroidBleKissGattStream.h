@@ -27,6 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
+#include <esp_gap_ble_api.h>
 
 #include <limits.h>
 #include <stddef.h>
@@ -69,10 +70,24 @@ public:
     uint16_t notifyFailureBackoffMs = 100;
     uint16_t writeQueueWaitMs = 0;
     uint32_t subscribeTimeoutMs = 10000;
-    uint16_t connMinInterval = 6;
+    // Requested connection parameters (interval in 1.25 ms units, timeout in
+    // 10 ms units). The defaults stay inside Apple's Accessory Design
+    // Guidelines (interval min >= 15 ms and a multiple of 15 ms, max = min or
+    // >= min + 15 ms, supervision timeout 6 s to 18 s), which iOS enforces by
+    // rejecting the whole request. 15 ms with latency 0 is also the shortest
+    // interval Android's CONNECTION_PRIORITY_HIGH settles on in practice.
+    uint16_t connMinInterval = 12;
     uint16_t connMaxInterval = 12;
     uint16_t connLatency = 0;
-    uint16_t connTimeout = 400;
+    uint16_t connTimeout = 600;
+    // Never send more than this many parameter update requests per connection,
+    // and never closer together than connRequestSpacingMs, so we cannot end up
+    // in a request/counter-offer loop with a central that prefers other values.
+    uint8_t maxConnParamRequests = 3;
+    uint32_t connRequestSpacingMs = 30000;
+    // LE Data Length Extension: ask for 251-byte link-layer payloads so a
+    // full-MTU ATT write travels as one PDU instead of ~10 fragments. 0 disables.
+    uint16_t preferredTxOctets = 251;
     esp_power_level_t txPower = ESP_PWR_LVL_P7;
   };
 
@@ -89,6 +104,24 @@ public:
     uint32_t txQueueFullDrops = 0;
     uint32_t txNotifyFailures = 0;
     uint32_t subscribeTimeoutDisconnects = 0;
+  };
+
+  // Link-layer state as last reported by the controller. Updated from the
+  // Bluetooth task; read it with linkInfo() from the main loop and compare
+  // generation to spot changes.
+  struct LinkInfo {
+    uint32_t generation = 0;
+    bool connected = false;
+    uint16_t connInterval = 0;   // 1.25 ms units, 0 = unknown.
+    uint16_t connLatency = 0;
+    uint16_t connTimeout = 0;    // 10 ms units.
+    uint8_t lastParamStatus = 0; // esp_bt_status_t of the last parameter update event.
+    uint16_t txOctets = 0;       // Negotiated LE data length, 0 = not reported (27 default).
+    uint16_t rxOctets = 0;
+    uint8_t lastDataLenStatus = 0;
+    bool dataLenReported = false;
+    uint16_t mtu = 23;
+    uint8_t connParamRequests = 0;
   };
 
   explicit BluedroidBleKissGattStream(const Config &config = Config()) : _config(config) {}
@@ -121,6 +154,7 @@ public:
       return false;
     }
     _server->setCallbacks(&_serverCallbacks);
+    BLEDevice::setCustomGapHandler(&BluedroidBleKissGattStream::gapEventThunk);
 
     BLEService *service = _server->createService(_config.serviceUuid);
     if (service == nullptr) {
@@ -358,6 +392,58 @@ public:
   const Stats &stats() const { return _stats; }
   void clearStats() { _stats = Stats{}; }
 
+  LinkInfo linkInfo() const {
+    portENTER_CRITICAL(&_linkMux);
+    LinkInfo info = _link;
+    portEXIT_CRITICAL(&_linkMux);
+    info.mtu = _mtu;
+    return info;
+  }
+
+  // True when the current parameters are at least as good as what we ask for.
+  bool connParamsMeetRequest() const {
+    LinkInfo info = linkInfo();
+    return info.connInterval != 0 && info.connInterval <= _config.connMaxInterval
+      && info.connLatency <= _config.connLatency;
+  }
+
+  // Ask the central again for the configured parameters, if the current ones
+  // are worse, and only within the per-connection request budget. Returns true
+  // if a request was sent.
+  bool requestConnParamsIfNeeded() {
+    if (!_connected || !_hasRemoteBda || connParamsMeetRequest()) {
+      return false;
+    }
+    uint8_t sent;
+    portENTER_CRITICAL(&_linkMux);
+    sent = _link.connParamRequests;
+    portEXIT_CRITICAL(&_linkMux);
+    if (sent >= _config.maxConnParamRequests) {
+      return false;
+    }
+    if ((uint32_t)(millis() - _lastConnParamRequestMs) < _config.connRequestSpacingMs) {
+      return false;
+    }
+    sendConnParamRequest();
+    return true;
+  }
+
+  // Longest gap between two incoming GATT writes since the last reset. Used
+  // to measure how badly the phone's link starves (e.g. under HFP/SCO).
+  uint32_t rxMaxGapMs() const {
+    portENTER_CRITICAL(&_incomingMux);
+    uint32_t gap = _rxMaxGapMs;
+    portEXIT_CRITICAL(&_incomingMux);
+    return gap;
+  }
+
+  void resetRxGapStats() {
+    portENTER_CRITICAL(&_incomingMux);
+    _rxMaxGapMs = 0;
+    _rxGapAnchored = false;
+    portEXIT_CRITICAL(&_incomingMux);
+  }
+
 private:
   struct QueueSlot {
     uint8_t data[OUTGOING_CHUNK_SIZE];
@@ -387,6 +473,12 @@ private:
       }
     }
   };
+
+  static void gapEventThunk(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    if (instanceSlot() != nullptr && param != nullptr) {
+      instanceSlot()->handleGapEvent(event, param);
+    }
+  }
 
   class InternalTxCallbacks : public BLECharacteristicCallbacks {
   public:
@@ -458,6 +550,16 @@ private:
   uint32_t _connectedAtMs = 0;
   uint32_t _lastNotifyAttemptMs = 0;
   uint32_t _notifyBackoffUntilMs = 0;
+  uint32_t _lastConnParamRequestMs = 0;
+  bool _hasRemoteBda = false;
+  esp_bd_addr_t _remoteBda = {};
+
+  LinkInfo _link{};
+  mutable portMUX_TYPE _linkMux = portMUX_INITIALIZER_UNLOCKED;
+
+  uint32_t _rxLastWriteMs = 0;
+  uint32_t _rxMaxGapMs = 0;
+  bool _rxGapAnchored = false;
 
   uint8_t _incomingBuf[INCOMING_STREAM_SIZE];
   size_t _incomingHead = 0;
@@ -491,6 +593,13 @@ private:
     _notifyBackoffUntilMs = 0;
     _lastNotifySucceeded = false;
     _lastNotifyStatusSeen = false;
+    _hasRemoteBda = false;
+    _lastConnParamRequestMs = 0;
+    portENTER_CRITICAL(&_linkMux);
+    uint32_t generation = _link.generation + 1;
+    _link = LinkInfo{};
+    _link.generation = generation;
+    portEXIT_CRITICAL(&_linkMux);
   }
 
   void clearIncomingStream() {
@@ -531,7 +640,16 @@ private:
       return;
     }
 
+    const uint32_t now = millis();
     portENTER_CRITICAL(&_incomingMux);
+    if (_rxGapAnchored) {
+      const uint32_t gap = now - _rxLastWriteMs;
+      if (gap > _rxMaxGapMs) {
+        _rxMaxGapMs = gap;
+      }
+    }
+    _rxLastWriteMs = now;
+    _rxGapAnchored = true;
     for (size_t i = 0; i < len; ++i) {
       if (!pushIncomingByteLocked(data[i])) {
         ++_stats.rxIncomingOverflowDrops;
@@ -695,13 +813,23 @@ private:
     if (_server != nullptr && param != nullptr) {
       _connId = param->connect.conn_id;
       _hasConnId = true;
+      memcpy(_remoteBda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+      _hasRemoteBda = true;
+      portENTER_CRITICAL(&_linkMux);
+      _link.connected = true;
+      _link.connInterval = param->connect.conn_params.interval;
+      _link.connLatency = param->connect.conn_params.latency;
+      _link.connTimeout = param->connect.conn_params.timeout;
+      ++_link.generation;
+      portEXIT_CRITICAL(&_linkMux);
       _LOGI("BLE KISS client connected: conn_id=%u", _connId);
-      _server->updateConnParams(
-          param->connect.remote_bda,
-          _config.connMinInterval,
-          _config.connMaxInterval,
-          _config.connLatency,
-          _config.connTimeout);
+      sendConnParamRequest();
+      if (_config.preferredTxOctets != 0) {
+        // Phones usually start the data length procedure themselves, but not
+        // all do. Asking is harmless: the controller negotiates down to what
+        // both sides support and reports it in SET_PKT_LENGTH_COMPLETE.
+        esp_ble_gap_set_pkt_data_len(_remoteBda, _config.preferredTxOctets);
+      }
     } else {
       _LOGI("BLE KISS client connected");
     }
@@ -726,6 +854,58 @@ private:
 
   void handleMtuChange(uint16_t mtu) {
     _mtu = (mtu < 23) ? 23 : mtu;
+    portENTER_CRITICAL(&_linkMux);
+    ++_link.generation;
+    portEXIT_CRITICAL(&_linkMux);
+  }
+
+  void sendConnParamRequest() {
+    if (_server == nullptr || !_hasRemoteBda) {
+      return;
+    }
+    _lastConnParamRequestMs = millis();
+    portENTER_CRITICAL(&_linkMux);
+    ++_link.connParamRequests;
+    portEXIT_CRITICAL(&_linkMux);
+    _server->updateConnParams(
+        _remoteBda,
+        _config.connMinInterval,
+        _config.connMaxInterval,
+        _config.connLatency,
+        _config.connTimeout);
+  }
+
+  // Runs on the Bluetooth task: only record, never log or touch the streams.
+  void handleGapEvent(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    switch (event) {
+      case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+        if (!_hasRemoteBda || memcmp(param->update_conn_params.bda, _remoteBda, sizeof(esp_bd_addr_t)) != 0) {
+          return;
+        }
+        portENTER_CRITICAL(&_linkMux);
+        _link.lastParamStatus = param->update_conn_params.status;
+        if (param->update_conn_params.status == ESP_BT_STATUS_SUCCESS) {
+          _link.connInterval = param->update_conn_params.conn_int;
+          _link.connLatency = param->update_conn_params.latency;
+          _link.connTimeout = param->update_conn_params.timeout;
+        }
+        ++_link.generation;
+        portEXIT_CRITICAL(&_linkMux);
+        break;
+      case ESP_GAP_BLE_SET_PKT_LENGTH_COMPLETE_EVT:
+        portENTER_CRITICAL(&_linkMux);
+        _link.lastDataLenStatus = param->pkt_data_lenth_cmpl.status;
+        if (param->pkt_data_lenth_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+          _link.txOctets = param->pkt_data_lenth_cmpl.params.tx_len;
+          _link.rxOctets = param->pkt_data_lenth_cmpl.params.rx_len;
+          _link.dataLenReported = true;
+        }
+        ++_link.generation;
+        portEXIT_CRITICAL(&_linkMux);
+        break;
+      default:
+        break;
+    }
   }
 
   void disconnectUnsubscribedClientIfNeeded() {
