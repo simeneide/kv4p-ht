@@ -389,6 +389,9 @@ void setMode(Mode newMode) {
       }
     break;
   }
+  // Record key/unkey at once: AX.25 transmits synchronously, so loop() does
+  // not run while it is keyed.
+  resetDiagnosticsUpdate(mode == MODE_TX, (desiredState.flags & HOST_STATE_HIGH_POWER) != 0, 0);
 }
 
 void logBleLinkInfo(const char *prefix) {
@@ -815,7 +818,7 @@ void squelchLoop() {
 }
 
 void loop() {
-  resetDiagnosticsLoop(mode == MODE_TX, (desiredState.flags & HOST_STATE_HIGH_POWER) != 0, millis() - txStartTime);
+  resetDiagnosticsUpdate(mode == MODE_TX, (desiredState.flags & HOST_STATE_HIGH_POWER) != 0, millis() - txStartTime);
   squelchLoop();
   debugLoop();
   ledLoop();

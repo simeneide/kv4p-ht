@@ -50,6 +50,7 @@ struct ResetBreadcrumb {
   uint8_t highPower;     // 1 if high power was selected at the last update.
   uint16_t reserved;
   uint32_t keyedForMs;   // How long the current transmission had lasted.
+  uint32_t check;        // Detects a breadcrumb torn by a reset mid-update.
 };
 
 static constexpr uint32_t RESET_BREADCRUMB_MAGIC = 0x4B563450; // "KV4P"
@@ -61,6 +62,16 @@ RTC_NOINIT_ATTR ResetBreadcrumb resetBreadcrumb;
 ResetBreadcrumb previousBreadcrumb = {};
 bool previousBreadcrumbValid = false;
 esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+// Formatted once at boot: reading and checking the dump scans up to 64 KB of
+// flash, which must not happen on every host connect.
+char *coreDumpLine = nullptr;
+
+uint32_t resetBreadcrumbCheck(const ResetBreadcrumb &b) {
+  return (b.magic ^ b.bootCount ^ (b.uptimeMs * 31) ^ ((uint32_t)b.keyed << 8) ^ ((uint32_t)b.highPower << 16)
+          ^ (b.keyedForMs * 7)) + 0x9E3779B9;
+}
+
+int formatCoreDumpLine(char *out, size_t outSize);
 
 const char *resetReasonName(esp_reset_reason_t reason) {
   switch (reason) {
@@ -97,10 +108,12 @@ const char *resetReasonDescription(esp_reset_reason_t reason) {
 // Call first thing in setup().
 void resetDiagnosticsBegin() {
   bootResetReason = esp_reset_reason();
-  // RTC slow memory survives software resets, panics and watchdogs, but not a
-  // power-on or a brownout (the rail dropped), so only trust it after those.
-  bool rtcSurvived = bootResetReason != ESP_RST_POWERON && bootResetReason != ESP_RST_BROWNOUT;
-  previousBreadcrumbValid = rtcSurvived && resetBreadcrumb.magic == RESET_BREADCRUMB_MAGIC;
+  // RTC slow memory survives software resets, panics and watchdogs, and
+  // usually a brownout (the RTC domain keeps its contents unless the supply
+  // collapses), but not a power-on. The magic and check word reject garbage.
+  previousBreadcrumbValid = bootResetReason != ESP_RST_POWERON
+    && resetBreadcrumb.magic == RESET_BREADCRUMB_MAGIC
+    && resetBreadcrumb.check == resetBreadcrumbCheck(resetBreadcrumb);
   if (previousBreadcrumbValid) {
     previousBreadcrumb = resetBreadcrumb;
   }
@@ -108,10 +121,18 @@ void resetDiagnosticsBegin() {
   resetBreadcrumb = {};
   resetBreadcrumb.magic = RESET_BREADCRUMB_MAGIC;
   resetBreadcrumb.bootCount = bootCount;
+  resetBreadcrumb.check = resetBreadcrumbCheck(resetBreadcrumb);
+
+  char line[400];
+  int n = formatCoreDumpLine(line, sizeof(line));
+  if (n > 0) {
+    coreDumpLine = strdup(line);
+  }
 }
 
-// Call from loop(); cheap, writes RTC memory at most every 100 ms.
-void resetDiagnosticsLoop(bool keyed, bool highPower, uint32_t keyedForMs) {
+// Call from loop() and on every key/unkey; cheap, writes RTC memory at most
+// every 100 ms unless the keyed state changed.
+void resetDiagnosticsUpdate(bool keyed, bool highPower, uint32_t keyedForMs) {
   static uint32_t lastUpdateMs = 0;
   uint32_t now = millis();
   bool keyedChanged = resetBreadcrumb.keyed != (keyed ? 1 : 0);
@@ -123,17 +144,21 @@ void resetDiagnosticsLoop(bool keyed, bool highPower, uint32_t keyedForMs) {
   resetBreadcrumb.keyed = keyed ? 1 : 0;
   resetBreadcrumb.highPower = highPower ? 1 : 0;
   resetBreadcrumb.keyedForMs = keyed ? keyedForMs : 0;
+  resetBreadcrumb.check = resetBreadcrumbCheck(resetBreadcrumb);
 }
 
-// Formats "Reset reason: ..." (the wording hosts already look for).
+// Formats "Reset reason: ..." (the wording hosts already look for). The most
+// useful fields come first: some hosts keep only the first 120 characters.
 int formatResetReasonLine(char *out, size_t outSize) {
-  int n = snprintf(out, outSize, "Reset reason: %s (%s), boot #%lu",
-                   resetReasonName(bootResetReason), resetReasonDescription(bootResetReason),
-                   (unsigned long)resetBreadcrumb.bootCount);
-  if (n > 0 && (size_t)n < outSize && previousBreadcrumbValid) {
-    n += snprintf(out + n, outSize - n, "; previous boot up %lu ms, keyed=%u high=%u keyed_for=%lu ms",
-                  (unsigned long)previousBreadcrumb.uptimeMs, previousBreadcrumb.keyed,
-                  previousBreadcrumb.highPower, (unsigned long)previousBreadcrumb.keyedForMs);
+  int n;
+  if (previousBreadcrumbValid) {
+    n = snprintf(out, outSize, "Reset reason: %s; prev keyed=%u high=%u keyed_for=%lums up=%lums; boot #%lu; %s",
+                 resetReasonName(bootResetReason), previousBreadcrumb.keyed, previousBreadcrumb.highPower,
+                 (unsigned long)previousBreadcrumb.keyedForMs, (unsigned long)previousBreadcrumb.uptimeMs,
+                 (unsigned long)resetBreadcrumb.bootCount, resetReasonDescription(bootResetReason));
+  } else {
+    n = snprintf(out, outSize, "Reset reason: %s; boot #%lu; %s", resetReasonName(bootResetReason),
+                 (unsigned long)resetBreadcrumb.bootCount, resetReasonDescription(bootResetReason));
   }
   return n;
 }
@@ -185,26 +210,26 @@ int formatCoreDumpLine(char *out, size_t outSize) {
 // Plain text on the USB serial port, printed before any kv4p framing so it is
 // readable with any serial monitor.
 void printResetDiagnostics(Print &out) {
-  char line[400];
+  char line[200];
   if (formatResetReasonLine(line, sizeof(line)) > 0) {
     out.println(line);
   }
-  if (formatCoreDumpLine(line, sizeof(line)) > 0) {
-    out.println(line);
+  if (coreDumpLine != nullptr) {
+    out.println(coreDumpLine);
   }
   out.printf("Heap free=%u min=%u largest=%u\n", (unsigned)ESP.getFreeHeap(),
              (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 }
 
-// The same report as COMMAND_DEBUG_INFO frames to one host session.
+// The same report as COMMAND_DEBUG_INFO frames to one host session. Sent on
+// every connect, so the same boot can be reported more than once; the boot
+// number tells repeats apart.
 void sendResetDiagnostics(Stream &out) {
-  char line[400];
-  int n = formatResetReasonLine(line, sizeof(line));
-  if (n > 0) {
+  char line[200];
+  if (formatResetReasonLine(line, sizeof(line)) > 0) {
     sendKv4pVendorFrame(out, COMMAND_DEBUG_INFO, (const uint8_t *)line, strnlen(line, sizeof(line)));
   }
-  n = formatCoreDumpLine(line, sizeof(line));
-  if (n > 0) {
-    sendKv4pVendorFrame(out, COMMAND_DEBUG_INFO, (const uint8_t *)line, strnlen(line, sizeof(line)));
+  if (coreDumpLine != nullptr) {
+    sendKv4pVendorFrame(out, COMMAND_DEBUG_INFO, (const uint8_t *)coreDumpLine, strlen(coreDumpLine));
   }
 }
