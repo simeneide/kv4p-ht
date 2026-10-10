@@ -71,12 +71,22 @@ static constexpr uint32_t TX_DRAIN_MAX_MS = 1500;
 // Credit kept free for control frames (PTT release, state) when deciding that
 // the host is out of window and playout must start.
 static constexpr size_t TX_CREDIT_RESERVE_BYTES = 512;
-// Sized for one BLE window (4096 B of KISS frames carry less than 4096 B of
-// audio payload), so a single host that honours flow control can never
-// overflow it. Static DRAM is tight on this build (BT enabled), so this is
-// deliberately not larger; if it does fill, the oldest frame is played early.
-static constexpr size_t TX_JITTER_CAPACITY_BYTES = 4096;
-static constexpr size_t TX_JITTER_CAPACITY_ENTRIES = 64;
+// Two BLE windows (BLE_KISS_WINDOW_SIZE is 4096). Credit is returned when a
+// frame is queued as long as the free space still covers the host's whole
+// window, so the buffer must be larger than one window plus the pre-roll for
+// the host to see real-time credit from the start (BLE: free stays above
+// 4096 B up to ~4 KB, ~500 ms, buffered). A host that honours flow control can
+// never overflow it; if one does, the oldest frame is played early. Allocated
+// on the heap (see txJitterBuffer.h).
+static constexpr size_t TX_JITTER_CAPACITY_BYTES = 8192;
+// Enough entries for frames of one ADPCM block or more (every known host), so
+// the byte limit is reached first; the +8 covers a partly played head frame.
+static constexpr size_t TX_JITTER_CAPACITY_ENTRIES = TX_JITTER_CAPACITY_BYTES / AUDIO_FRAME_BYTES + 8;
+static constexpr uint32_t TX_JITTER_CAPACITY_MS =
+    (uint32_t)((uint64_t)TX_JITTER_CAPACITY_BYTES * AUDIO_FRAME_SAMPLES_WIRE / AUDIO_FRAME_BYTES * 1000 / AUDIO_WIRE_SAMPLE_RATE);
+static_assert(TX_JITTER_CAPACITY_MS + TX_PLAYOUT_FLUSH_US / 1000 < TX_DRAIN_MAX_MS,
+              "a full buffer must be able to drain before the drain cap");
+static_assert(TX_JITTER_CAPACITY_MS > TX_PREROLL_WIRELESS_MS, "the pre-roll must fit");
 
 // Counts PCM bytes on their way to I2S, so playout can be paced against the
 // clock without querying the DMA. Also measures time spent blocked in
@@ -223,17 +233,28 @@ struct TxCreditBatch {
 };
 TxCreditBatch txCredits;
 
-static void txQueueCredit(const TxJitterEntry &meta) {
-  const ProtocolSession *session = static_cast<const ProtocolSession *>(meta.ackTag);
-  if (session == nullptr || meta.ackBytes == 0) {
+static void txQueueCredit(const ProtocolSession *session, size_t bytes) {
+  if (session == nullptr || bytes == 0) {
     return;
   }
   for (size_t i = 0; i < TxCreditBatch::MAX_SESSIONS; i++) {
     if (txCredits.session[i] == session || txCredits.session[i] == nullptr) {
       txCredits.session[i] = session;
-      txCredits.bytes[i] += meta.ackBytes;
+      txCredits.bytes[i] += bytes;
       return;
     }
+  }
+}
+
+static void txQueueCredit(const TxJitterEntry &meta) {
+  txQueueCredit(static_cast<const ProtocolSession *>(meta.ackTag), meta.ackBytes);
+}
+
+// Return whatever credit the session's window no longer needs held (see
+// TxJitterBuffer::releaseCredit). Queued; sent by txFlushCredits().
+static void txReleaseCredit(const ProtocolSession *session) {
+  if (session != nullptr) {
+    txQueueCredit(session, txJitter.releaseCredit(session, session->windowSize));
   }
 }
 
@@ -438,11 +459,14 @@ void processTxAudio(ProtocolSession &session, uint8_t *src, size_t len) {
       }
       break;
     }
-    // The host sent more than its window. Play the oldest frame early
-    // (blocking on I2S if needed) rather than dropping audio: dropping part of
-    // the ADPCM byte stream would misalign every block after it.
+    // The host sent more than its credit allowed. Play the oldest audio
+    // early (blocking on I2S if needed) rather than dropping it: dropping part
+    // of the ADPCM byte stream would misalign every block after it.
     txPlayChunk();
   }
+  // Credit on receipt, bounded by free space: the host sees real-time credit
+  // during the pre-roll, and a faster than real-time burst stops at the buffer.
+  txReleaseCredit(&session);
   txFlushCredits();
   esp_task_wdt_reset();
 }
@@ -493,6 +517,8 @@ void txPlayoutLoop() {
     }
     deficit = txPlayoutDeficitSamples();
   }
+  // Playing freed space: credit held back for a burst can go now.
+  txReleaseCredit(txPlayout.lastSession);
   txFlushCredits();
 }
 

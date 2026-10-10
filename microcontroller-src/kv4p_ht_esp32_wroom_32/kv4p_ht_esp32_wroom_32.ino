@@ -462,7 +462,7 @@ void logTxSummary() {
                    "TX summary: keyed=%lu ms frames_in=%lu bytes_in=%lu played=%lu (~%lu ms) preroll=%lu ms "
                    "reached=%s@%lu ms underruns=%lu gap_silence=%lu ms lead_silence=%lu ms max_frame_gap=%lu ms "
                    "max_ble_write_gap=%lu ms peak=%lu B (%lu ms) overflows=%lu late=%lu i2s_blocked=%lu ms discarded=%lu drain=%lu ms "
-                   "ble=%s interval=%u.%02u ms latency=%u mtu=%u dle=%u/%u heap=%u min=%u",
+                   "ble=%s interval=%u.%02u ms latency=%u mtu=%u dle=%u/%u heap=%u min=%u credit_held=%lu B",
                    (unsigned long)keyedMs, (unsigned long)js.framesIn, (unsigned long)js.bytesIn,
                    (unsigned long)js.framesOut, (unsigned long)audioMs, (unsigned long)txJitter.prerollMs(),
                    js.prerollReached ? "yes" : "no", (unsigned long)js.prerollReachedMs, (unsigned long)js.underruns,
@@ -475,7 +475,8 @@ void logTxSummary() {
                    (unsigned long)txPlayout.framesDiscardedAtEnd, (unsigned long)txPlayout.drainMs,
                    protocolHasBleSession() ? "yes" : "no", (link.connInterval * 125) / 100,
                    (link.connInterval * 125) % 100, link.connLatency, link.mtu, link.txOctets, link.rxOctets,
-                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+                   (unsigned long)js.peakHeldAckBytes);
 }
 
 void setup() {

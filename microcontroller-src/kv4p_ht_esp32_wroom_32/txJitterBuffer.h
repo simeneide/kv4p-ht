@@ -21,6 +21,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <stdint.h>
 #include <string.h>
 
+#include <memory>
+
 // Encoded TX audio jitter buffer.
 //
 // Host TX audio frames (ADPCM) are queued here instead of being decoded the
@@ -31,9 +33,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // to pre-rolling instead of playing each late frame as soon as it trickles in.
 //
 // Each entry remembers the flow-control credit (encoded KISS frame length) of
-// the frame that carried it, so credits go back to the host only as audio is
-// actually consumed. With the host honouring the window, the buffer can never
-// hold more than one window of audio, which bounds both memory and latency.
+// the frame that carried it. releaseCredit() hands credit back as soon as a
+// frame is queued, as long as the host could not then send more than the
+// buffer has room for: the credit still held for a session never drops below
+// its window minus the free space. So the host sees credit flow in real time
+// from the first frame (including during the pre-roll), while a faster than
+// real-time burst is held back by free space, not by the window. Whatever
+// credit is still held for a frame goes back when the frame is consumed.
+//
+// Frames are consumed in chunks (popChunk) so a large host frame (several
+// ADPCM blocks) can be played out a block at a time, at the DAC's pace.
+//
+// The audio storage is allocated on the heap once, at construction, to keep
+// the static DRAM segment (tight with Bluetooth enabled) free.
 //
 // The class is transport and hardware agnostic so it can be unit tested
 // natively; the caller owns timing, decoding and the I2S output.
@@ -59,12 +71,14 @@ public:
     bool prerollReached = false;
     uint32_t peakBytes = 0;
     uint32_t maxArrivalGapMs = 0;     // Longest gap between two pushes.
+    uint32_t peakHeldAckBytes = 0;    // Most credit held back at once (after releaseCredit).
   };
 
   // samplesPerBlock / bytesPerBlock convert buffered bytes to audio time.
   // For IMA WAV ADPCM mono that is 249 samples per 128-byte block.
   TxJitterBuffer(uint32_t sampleRate, uint32_t samplesPerBlock, uint32_t bytesPerBlock)
-    : _sampleRate(sampleRate), _samplesPerBlock(samplesPerBlock), _bytesPerBlock(bytesPerBlock) {}
+    : _sampleRate(sampleRate), _samplesPerBlock(samplesPerBlock), _bytesPerBlock(bytesPerBlock),
+      _bytes(new uint8_t[CAPACITY_BYTES]) {}
 
   // Start a new transmission. prerollMs is the target buffered audio before
   // playout starts (and restarts after an underrun).
@@ -84,6 +98,9 @@ public:
 
   void setPrerollMs(uint32_t prerollMs) { _prerollMs = prerollMs; }
   uint32_t prerollMs() const { return _prerollMs; }
+
+  size_t freeBytes() const { return CAPACITY_BYTES - _byteCount; }
+  static constexpr size_t capacityBytes() { return CAPACITY_BYTES; }
 
   bool canAccept(size_t len) const {
     return len > 0 && len <= CAPACITY_BYTES && _count < CAPACITY_ENTRIES
@@ -229,6 +246,37 @@ public:
     }
   }
 
+  // Hand back credit for ackTag early, keeping only what bounds the host by
+  // free space: a host with `window` bytes of credit can have at most
+  // window - held bytes on the way, so holding at least window - freeBytes()
+  // means whatever it sends next always fits. Credit counts encoded KISS bytes,
+  // which are never fewer than the payload they carry, so the bound is
+  // conservative. window 0 means unknown: hold everything until played.
+  // Returns the credit released (to send to that session now).
+  size_t releaseCredit(const void *ackTag, size_t window) {
+    size_t released = 0;
+    if (ackTag != nullptr && window > 0) {
+      size_t held = heldAckBytesFor(ackTag);
+      size_t free = freeBytes();
+      size_t mustHold = window > free ? window - free : 0;
+      size_t releasable = held > mustHold ? held - mustHold : 0;
+      size_t idx = _head;
+      for (size_t i = 0; i < _count && releasable > 0; ++i) {
+        Entry &e = _entries[idx];
+        if (e.ackTag == ackTag && e.ackBytes > 0) {
+          uint16_t part = e.ackBytes < releasable ? e.ackBytes : (uint16_t)releasable;
+          e.ackBytes = (uint16_t)(e.ackBytes - part);
+          _heldAckBytes -= part;
+          releasable -= part;
+          released += part;
+        }
+        idx = (idx + 1) % CAPACITY_ENTRIES;
+      }
+    }
+    if (_heldAckBytes > _stats.peakHeldAckBytes) _stats.peakHeldAckBytes = (uint32_t)_heldAckBytes;
+    return released;
+  }
+
   // Credit currently held for one session (the host's window is per session).
   size_t heldAckBytesFor(const void *ackTag) const {
     size_t held = 0;
@@ -264,7 +312,7 @@ private:
   uint32_t _samplesPerBlock;
   uint32_t _bytesPerBlock;
 
-  uint8_t _bytes[CAPACITY_BYTES];
+  std::unique_ptr<uint8_t[]> _bytes;
   size_t _byteHead = 0;
   size_t _byteTail = 0;
   size_t _byteCount = 0;

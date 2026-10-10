@@ -303,6 +303,90 @@ void test_partly_played_frame_wraps_and_discards_cleanly() {
   TEST_ASSERT_EQUAL_UINT32(0, b.heldAckBytes());
 }
 
+// --- Credit on receipt, bounded by free buffer space ---
+
+void test_credit_returned_on_receipt_during_preroll() {
+  BigBuffer b = makeBigBuffer(300);
+  auto f = bigFrame(1);
+  // A real-time host filling the pre-roll gets every frame's credit back at
+  // once, so it sees credit flowing in real time before playout starts.
+  for (int i = 0; i < 5; i++) {
+    TEST_ASSERT_TRUE(b.push(f.data(), f.size(), &SESSION_A, BIG_ACK, (uint32_t)(i * 62)));
+    TEST_ASSERT_EQUAL(BIG_ACK, b.releaseCredit(&SESSION_A, BLE_WINDOW));
+  }
+  TEST_ASSERT_FALSE(b.playing());
+  TEST_ASSERT_EQUAL_UINT32(0, b.heldAckBytesFor(&SESSION_A));
+  TEST_ASSERT_EQUAL_UINT32(0, b.stats().peakHeldAckBytes);
+}
+
+void test_burst_credit_is_bounded_by_free_space() {
+  // Record-then-send: the host sends as fast as credit allows and nothing is
+  // played. It must never be able to send more than fits.
+  BigBuffer b = makeBigBuffer(300);
+  auto f = bigFrame(1);
+  size_t hostCredit = BLE_WINDOW;
+  int sent = 0;
+  while (hostCredit >= BIG_ACK && sent < 1000) {
+    hostCredit -= BIG_ACK;
+    TEST_ASSERT_TRUE_MESSAGE(b.push(f.data(), f.size(), &SESSION_A, BIG_ACK, 0), "host overran the buffer");
+    sent++;
+    hostCredit += b.releaseCredit(&SESSION_A, BLE_WINDOW);
+    // Whatever the host may still send fits in the free space.
+    TEST_ASSERT_TRUE(hostCredit <= b.freeBytes());
+    TEST_ASSERT_TRUE(BLE_WINDOW - b.heldAckBytesFor(&SESSION_A) <= b.freeBytes());
+  }
+  TEST_ASSERT_EQUAL_UINT32(0, b.stats().overflows);
+  // It stopped with the buffer nearly full and credit held back.
+  TEST_ASSERT_TRUE(b.freeBytes() < BIG_ACK * 2);
+  TEST_ASSERT_TRUE(b.heldAckBytesFor(&SESSION_A) >= BLE_WINDOW - b.freeBytes());
+  TEST_ASSERT_TRUE(b.stats().peakHeldAckBytes > 0);
+
+  // Playing one frame frees room; its credit (and nothing extra) flows back.
+  BigBuffer::Entry meta;
+  size_t returned = 0;
+  for (int i = 0; i < 4; i++) {
+    b.popChunk([](const uint8_t *, size_t) {}, 128, meta);
+    returned += meta.ackBytes;
+    returned += b.releaseCredit(&SESSION_A, BLE_WINDOW);
+  }
+  hostCredit += returned;
+  TEST_ASSERT_TRUE(hostCredit <= b.freeBytes());
+  TEST_ASSERT_TRUE(hostCredit >= BIG_ACK);
+  TEST_ASSERT_TRUE(b.push(f.data(), f.size(), &SESSION_A, BIG_ACK, 0));
+}
+
+void test_credit_is_returned_exactly_once() {
+  BigBuffer b = makeBigBuffer(300);
+  auto f = bigFrame(1);
+  size_t total = 0;
+  size_t returned = 0;
+  for (int i = 0; i < 14; i++) {
+    TEST_ASSERT_TRUE(b.push(f.data(), f.size(), &SESSION_A, BIG_ACK, 0));
+    total += BIG_ACK;
+    returned += b.releaseCredit(&SESSION_A, BLE_WINDOW);
+  }
+  BigBuffer::Entry meta;
+  while (!b.empty()) {
+    b.popChunk([](const uint8_t *, size_t) {}, 128, meta);
+    returned += meta.ackBytes;
+    returned += b.releaseCredit(&SESSION_A, BLE_WINDOW);
+  }
+  TEST_ASSERT_EQUAL(total, returned);
+  TEST_ASSERT_EQUAL_UINT32(0, b.heldAckBytes());
+}
+
+void test_unknown_window_holds_credit_until_played() {
+  BigBuffer b = makeBigBuffer(300);
+  auto f = bigFrame(1);
+  b.push(f.data(), f.size(), &SESSION_A, BIG_ACK, 0);
+  TEST_ASSERT_EQUAL(0, b.releaseCredit(&SESSION_A, 0));
+  TEST_ASSERT_EQUAL(0, b.releaseCredit(nullptr, BLE_WINDOW));
+  TEST_ASSERT_EQUAL_UINT32(BIG_ACK, b.heldAckBytesFor(&SESSION_A));
+  // Another session's credit is not touched.
+  TEST_ASSERT_EQUAL(0, b.releaseCredit(&SESSION_B, BLE_WINDOW));
+  TEST_ASSERT_EQUAL_UINT32(BIG_ACK, b.heldAckBytes());
+}
+
 // --- PTT release drain ---
 
 void test_repress_during_drain_continues_the_same_over() {
@@ -439,6 +523,10 @@ int main(int, char **) {
   RUN_TEST(test_preroll_with_512_byte_frames_uses_real_duration);
   RUN_TEST(test_pop_chunk_plays_a_large_frame_block_by_block);
   RUN_TEST(test_partly_played_frame_wraps_and_discards_cleanly);
+  RUN_TEST(test_credit_returned_on_receipt_during_preroll);
+  RUN_TEST(test_burst_credit_is_bounded_by_free_space);
+  RUN_TEST(test_credit_is_returned_exactly_once);
+  RUN_TEST(test_unknown_window_holds_credit_until_played);
   RUN_TEST(test_repress_during_drain_continues_the_same_over);
   RUN_TEST(test_policy_ptt_release_starts_drain);
   RUN_TEST(test_policy_filter_change_during_drain_is_deferred);
