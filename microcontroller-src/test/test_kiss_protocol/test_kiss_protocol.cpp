@@ -572,6 +572,43 @@ void test_parser_ack_is_written_to_input_stream() {
   TEST_ASSERT_EQUAL_UINT8_ARRAY(expectedAck, stream.written(), sizeof(expectedAck));
 }
 
+static uint32_t claimedAck = 0;
+
+static void claimingHandler(ProtocolSession &session, RcvCommand, uint8_t *, size_t) {
+  claimedAck = protocolClaimFrameAck(session);
+}
+
+void test_handler_can_defer_window_ack() {
+  const uint8_t frame[] = {
+    KISS_FEND, KISS_CMD_SETHARDWARE, 'K', 'V', '4', 'P', KV4P_PROTOCOL_VERSION, COMMAND_HOST_TX_AUDIO,
+    0x01, 0x02, 0x03, KISS_FEND
+  };
+  FakeStream stream(frame, sizeof(frame));
+  ProtocolSession session = { &stream, true, 0, 0 };
+  KissParser parser(session, &claimingHandler, &handleAx25Data);
+  claimedAck = 0;
+
+  while (stream.available() > 0) {
+    parser.loop();
+  }
+
+  // The handler took the credit, so the parser sent nothing...
+  TEST_ASSERT_EQUAL_UINT32(sizeof(frame), claimedAck);
+  TEST_ASSERT_EQUAL(0, stream.writtenLen());
+  TEST_ASSERT_EQUAL_UINT32(0, session.pendingFrameAck);
+
+  // ...and returning it later produces the same WINDOW_UPDATE as before.
+  sendWindowAck(stream, claimedAck);
+  const uint8_t expectedAck[] = {
+    KISS_FEND, KISS_CMD_SETHARDWARE,
+    'K', 'V', '4', 'P', KV4P_PROTOCOL_VERSION, COMMAND_WINDOW_UPDATE,
+    (uint8_t)sizeof(frame), 0x00, 0x00, 0x00,
+    KISS_FEND
+  };
+  TEST_ASSERT_EQUAL(sizeof(expectedAck), stream.writtenLen());
+  TEST_ASSERT_EQUAL_UINT8_ARRAY(expectedAck, stream.written(), sizeof(expectedAck));
+}
+
 static int runKissProtocolTests() {
   UNITY_BEGIN();
   RUN_TEST(test_data_frame_unescapes_and_dispatches_ax25);
@@ -599,6 +636,7 @@ static int runKissProtocolTests() {
   RUN_TEST(test_send_audio_routes_only_to_rx_audio_open_sessions);
   RUN_TEST(test_global_freedv_mode_selects_digital_routing);
   RUN_TEST(test_parser_ack_is_written_to_input_stream);
+  RUN_TEST(test_handler_can_defer_window_ack);
   return UNITY_END();
 }
 

@@ -127,6 +127,10 @@ struct ProtocolSession {
   bool connected;
   uint16_t flags;
   size_t windowSize;
+  // Flow-control credit of the frame currently being dispatched. A command
+  // handler may claim it with protocolClaimFrameAck() and return it later
+  // (for example once buffered TX audio is actually played).
+  uint32_t pendingFrameAck;
 };
 
 bool protocolSessionConnected(const ProtocolSession &session) {
@@ -138,19 +142,31 @@ ProtocolSession protocolUsbSession = {
   .connected = true,
   .flags = 0,
   .windowSize = 0,
+  .pendingFrameAck = 0,
 };
 ProtocolSession protocolBtSession = {
   .stream = nullptr,
   .connected = false,
   .flags = 0,
   .windowSize = 0,
+  .pendingFrameAck = 0,
 };
 ProtocolSession protocolBleSession = {
   .stream = nullptr,
   .connected = false,
   .flags = 0,
   .windowSize = 0,
+  .pendingFrameAck = 0,
 };
+
+// Take ownership of the current frame's flow-control credit. The parser then
+// does not send COMMAND_WINDOW_UPDATE for it; the caller must send it later with
+// sendWindowAck() (or drop it if the session has gone away).
+uint32_t protocolClaimFrameAck(ProtocolSession &session) {
+  uint32_t ack = session.pendingFrameAck;
+  session.pendingFrameAck = 0;
+  return ack;
+}
 
 bool protocolHasBtSession() {
   return protocolSessionConnected(protocolBtSession);
@@ -449,10 +465,12 @@ private:
     if (b == KISS_FEND) {
       _encodedFrameLen++;
       if (_frameLen > 0 && !_dropFrame) {
+        _session.pendingFrameAck = _encodedFrameLen;
         processFrame();
-        if (_session.stream != nullptr) {
-          sendWindowAck(*_session.stream, _encodedFrameLen);
+        if (_session.stream != nullptr && _session.pendingFrameAck > 0) {
+          sendWindowAck(*_session.stream, _session.pendingFrameAck);
         }
+        _session.pendingFrameAck = 0;
         resetParser();
         _inFrame = true;
         _encodedFrameLen = 1;
