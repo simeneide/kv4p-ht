@@ -149,69 +149,130 @@ slots, but they cannot create airtime that SCO has taken.
 
 ## 4. TX jitter buffer
 
-Files: `txJitterBuffer.h` (pure logic, unit tested), `txAudio.h`,
-`protocol.h`, `kv4p_ht_esp32_wroom_32.ino`.
+Files: `txJitterBuffer.h` and `txKeyPolicy.h` (pure logic, unit tested),
+`txAudio.h`, `protocol.h`, `kv4p_ht_esp32_wroom_32.ino`.
 
 `COMMAND_HOST_TX_AUDIO` frames are no longer decoded on arrival. They go into a
-FIFO of encoded ADPCM (4 KB, 64 frames), and the main loop plays them out at
-the DAC's pace:
+FIFO of encoded ADPCM (8 KB, about 1 s, 72 entries), and the main loop plays
+them out at the DAC's pace. Frames may carry any number of 128-byte IMA ADPCM
+blocks: the Android app sends one per frame (~15.6 ms), pgpilot sends four
+(512 B, ~62 ms). Every duration below (pre-roll level, buffered and peak time,
+played time) is computed from the audio the bytes actually hold, not from a
+frame count.
 
 * **Pre-roll.** Playout starts when `TX_PREROLL_WIRELESS_MS` (300 ms) of audio
   is buffered, or when the first buffered frame is 300 ms old (a host that
   cannot fill the target is never stalled), or when the host is nearly out of
   window credit, or when PTT is released. USB gets `TX_PREROLL_USB_MS` (40 ms)
-  because it does not burst. Classic Bluetooth uses the 300 ms target, but its
-  2048 B window triggers the credit-pressure start at about 1.5 KB held, so in
-  practice it pre-rolls about 170 ms and can never hold more than about 220 ms.
-  Until playout starts the DAC gets explicit silence.
+  because it does not burst. Classic Bluetooth uses the 300 ms target too (its
+  2048 B window no longer limits the pre-roll, since credit comes back on
+  receipt; see Flow control). Until playout starts the DAC gets explicit
+  silence.
 * **Underrun.** If the buffer runs dry mid-transmission, the firmware writes
   silence (never the stale DMA contents) and goes back to pre-rolling, instead
   of playing each late frame the moment it trickles in. After a stall the
   backlog usually arrives as a burst, refills the target at once, and playout
   resumes; each stall therefore costs one gap rather than a string of stutters.
-* **Flow control.** The parser normally returns a frame's credit
-  (`COMMAND_WINDOW_UPDATE`) right after dispatching it. A TX audio frame's
-  credit is now claimed by the buffer (`protocolClaimFrameAck()`) and returned
-  when that frame is played. A host that honours the window therefore holds at
-  most one window of audio in the radio (BLE: 4096 B, about 470 ms), which
-  bounds latency and memory, and a whole recording sent faster than real time
-  is paced to real time by the credits. The FIFO is sized for one BLE window;
-  if a host overruns it anyway, the oldest frame is played early (nothing is
-  dropped, since dropping part of the ADPCM byte stream would misalign every
-  later block). Credits for frames still buffered when TX ends (watchdog,
-  runaway timer, switching to FreeDV while keyed) are returned too, and
-  credits belonging to a session that disconnected are dropped, since a
-  reconnecting host starts a fresh window. Credits are sent as one
-  `COMMAND_WINDOW_UPDATE` per session per loop pass, so returning many frames
-  at once does not flood a congested BLE notify queue. Window pressure is
-  judged per session.
+* **Flow control: credit on receipt, bounded by free space.** The parser
+  normally returns a frame's credit (`COMMAND_WINDOW_UPDATE`) right after
+  dispatching it. A TX audio frame's credit is claimed by the buffer
+  (`protocolClaimFrameAck()`), and handed back as soon as the frame is queued,
+  as long as the buffer could still take everything the host may send with the
+  credit it then has. The rule (`TxJitterBuffer::releaseCredit()`): the credit
+  held back for a session never drops below its window minus the free buffer
+  space. A host with window W and H bytes held back can have at most W - H
+  bytes on the way or still to send, and W - H <= free space, so whatever it
+  sends next always fits. Credit counts encoded KISS bytes, which are never
+  fewer than the payload they carry, so the bound is conservative. Credit
+  still held for a frame goes back when the frame is played.
+
+  Why not return credit only when a frame is played (the first version)? With
+  the buffer as large as the BLE window, that was the only safe choice, but it
+  meant the pre-roll held about 300 ms of credit: a host measuring credit per
+  second about one second into an over saw 0.33 to 0.66 of real time and could
+  take a healthy link for a starved one. The buffer is now twice the BLE window
+  (8 KB vs 4 KB), so with the pre-roll and normal jitter in it the free space
+  still exceeds the window and every frame's credit goes straight back: the
+  host sees real-time credit from the first frame. Only a faster than
+  real-time burst (record-then-send) fills it past about 4 KB (~500 ms); from
+  there credit is held back and released as audio plays, so the buffer, not
+  the host window, is the bound, and a compliant host can never overflow it.
+  The summary's `credit_held` field shows the most credit held back at once
+  (0 for a real-time over). If a host overruns its window anyway, the oldest
+  audio is played early (nothing is dropped, since dropping part of the ADPCM
+  byte stream would misalign every later block). Credits for frames still
+  buffered when TX ends (watchdog, runaway timer, switching to FreeDV while
+  keyed) are returned too, and credits belonging to a session that
+  disconnected are dropped, since a reconnecting host starts a fresh window.
+  Credits are sent as one `COMMAND_WINDOW_UPDATE` per session per loop pass,
+  so returning many frames at once does not flood a congested BLE notify
+  queue. A session with an unknown window (0) keeps the old behaviour (credit
+  returned when played). The 72 entries cover frames of one ADPCM block or
+  more, which is what every known host sends; a host sending smaller frames
+  could run out of entries first and would then get early playout.
 * **Pacing.** The I2S TX DMA is a ring of 6 x 512 samples (64 ms at 48 kHz)
-  that never stops. The loop writes one frame (747 samples at 48 kHz) each time
-  a frame plus one DMA buffer has been consumed, measured with
-  `esp_timer_get_time()` against the bytes written. Writes therefore never
-  block on I2S, the loop keeps spinning, and incoming frames are parsed as fast
-  as they arrive. If the loop is held up long enough for the DAC to replay old
-  buffers, the summary counts a `late` tick and pacing resumes without trying
-  to catch up. The DMA geometry (6 x 512) is set explicitly in `initI2STx()`.
-  The pacing is open loop against `esp_timer`. Both clocks derive from the same
-  crystal and the margin is about 35 ms, so drift should not matter within the
-  200 s runaway limit. The summary's `i2s_blocked` field checks this on real
-  hardware: it should stay at 0 ms.
+  that never stops. Playout is done one ADPCM block (128 B, 249 samples at
+  16 kHz, 747 at 48 kHz) at a time whatever the host frame size, written each
+  time a block plus one DMA buffer has been consumed, measured with
+  `esp_timer_get_time()` against the PCM bytes actually written. A 512 B frame
+  is therefore played as four blocks over four slots, not written at once (a
+  62 ms write into a 64 ms ring would wait about 30 ms for space, which is what
+  the first version did with pgpilot frames: `i2s_blocked` at about half of
+  every over). Writes never block on I2S, the loop keeps spinning, and
+  incoming frames are parsed as fast as they arrive. If the loop is held up
+  long enough for the DAC to replay old buffers, the summary counts a `late`
+  tick and pacing resumes without trying to catch up. The DMA geometry
+  (6 x 512) is set explicitly in `initI2STx()`. The pacing is open loop against
+  `esp_timer`. Both clocks derive from the same crystal and the margin is about
+  35 ms, so drift should not matter within the 200 s runaway limit. The
+  summary's `i2s_blocked` field checks this on real hardware: it should stay
+  at 0 ms.
 * **PTT release.** When PTT is released with audio still buffered, the radio
   stays keyed until the buffer and the DMA ring have played out
-  (`TX_DRAIN_MAX_MS` = 1.5 s cap), so the last 300 ms of speech is not cut. The
-  previous code also cut the last ~50 ms in the DMA ring at unkey. Re-keying
-  during the drain cancels it and restarts the TX watchdog. The TX watchdog
-  (778 ms without frames), the runaway timer, revoking TX_ALLOWED, and a
-  release that also retunes or refilters the SA818 still unkey immediately (the
-  SA818 is never sent AT commands under a carrier it was asked to drop).
-  End-of-TX bookkeeping (credit returns, the summary line) runs only after the
-  transmitter is off.
+  (`TX_DRAIN_MAX_MS` = 1.5 s cap, above the ~1 s a full buffer holds), so the
+  last 300 ms of speech is not cut. A filter or emphasis change that arrives
+  during the drain waits for it and is applied right after unkey. Hosts often
+  release in two writes (pgpilot: PTT off with pre-emphasis still set, then
+  pre-emphasis off); the first version refused the second write's filter
+  change under carrier by unkeying at once, which threw away the buffered tail
+  of every over (4 to 5 frames, about 250 to 310 ms). Re-keying during the
+  drain cancels it, continues the same over (no new pre-roll while audio is
+  still buffered, one summary line at the end) and restarts the TX watchdog.
+  The TX watchdog (778 ms without frames), the runaway timer, revoking
+  TX_ALLOWED, and a release that also retunes the SA818 (frequency, bandwidth,
+  tones, squelch) still unkey immediately: the SA818 is never sent a group
+  command under a carrier it was asked to drop. A filter change that waited
+  for a drain is also applied after those unkeys. While PTT is held,
+  configuration changes apply as they arrive, as upstream always did. The
+  decision is `planTxReconcile()` in `txKeyPolicy.h`. End-of-TX bookkeeping
+  (credit returns, the summary line) runs only after the transmitter is off.
 * **FreeDV 2400B and AX.25** do not use this path, and AX.25 packets get no
   summary line.
-* **Feature bit.** HELLO advertises `FEATURE_HAS_TX_JITTER_BUFFER` (bit 7, chosen to stay clear of upstream's next allocations until agreed) so
-  hosts can tell which behaviour they are talking to. Existing hosts ignore
-  unknown bits.
+* **Feature bit.** HELLO advertises `FEATURE_HAS_TX_JITTER_BUFFER` (bit 7,
+  chosen to stay clear of upstream's next allocations until agreed) so hosts
+  can tell which behaviour they are talking to. Existing hosts ignore unknown
+  bits.
+
+**What a host should do with bit 7.** When the bit is set, the radio buffers
+about 300 ms of audio before it plays (40 ms on USB) and keeps the carrier
+after PTT release until that audio has played. A host should then:
+
+* keep sending audio in real time from PTT-down and not pre-buffer on its
+  side for jitter (the radio does that); frames of one or more whole 128-byte
+  ADPCM blocks are fine;
+* expect credit to come back as frames arrive (real time from the first
+  frame), and only hold back during a faster than real-time burst, so a credit
+  rate measured from the first WINDOW_UPDATE is a fair link measure;
+* expect `DEVICE_STATE_TX_ACTIVE` to stay set for up to about 300 to 400 ms
+  after PTT release (longer after a burst, up to about 1 s), and not treat
+  that as a stuck transmitter; filter or emphasis changes sent with or after
+  the release are applied once it drops;
+* expect a PTT re-press within that window to continue the same over;
+* not count the pre-roll as latency to compensate for: mouth-to-air is about
+  300 ms more than without the bit.
+
+Without the bit, the radio plays frames as they arrive and returns credit at
+once, as upstream firmware does.
 
 **When to key the SA818.** The transmitter is keyed at PTT-down, as before,
 and the pre-roll goes out as silence on the carrier. Receivers need time to
@@ -224,31 +285,39 @@ key watch, for example) are unaffected. The cost is up to 300 ms of carrier
 before speech, which is normal for a voice over.
 
 **Latency.** Mouth-to-air goes up by the pre-roll (about 300 ms over
-Bluetooth, 40 ms over USB) plus about 50 ms of DMA. On a link that stalls, the
-radio-side backlog is capped by the window; any further backlog is on the host.
+Bluetooth, 40 ms over USB) plus about 50 ms of DMA. On a link that stalls and
+then bursts, the radio-side backlog can now grow to the buffer size (about
+1 s) instead of one window (about 470 ms); the total delay is the same either
+way, since the rest of the backlog used to wait on the host instead.
 
-**Memory.** The buffer adds about 5.5 KB of static DRAM (4 KB of audio, the
-entry table and counters). Static DRAM is the tight resource on this build:
-with Bluetooth enabled the `dram0_0_seg` region is 124,580 B and upstream main
-already used 110,740 B. This change leaves about 8.4 KB of headroom, which is
-why the buffer is not larger. Free and minimum free heap are printed at boot
-and in each TX summary.
+**Memory.** The 8 KB of audio storage is allocated on the heap once, at boot,
+so it does not count against the static DRAM segment, which is the tight
+resource on this build: with Bluetooth enabled `dram0_0_seg` is 124,580 B and
+upstream main already used 110,740 B. The static part of the buffer (entry
+table and counters) is under 1 KB, so this build uses less static DRAM than
+the first version with its 4 KB static buffer. The heap is 8 KB smaller
+instead; free and minimum free heap are printed at boot and in each TX
+summary (`heap`, `min`).
 
 ### TX summary line
 
 When a voice transmission ends, one `COMMAND_DEBUG_INFO` line is sent to
 every connected session including USB, in release builds as well (values
-illustrative):
+illustrative, a 10 s pgpilot over with 512 B frames):
 
 ```
-TX summary: keyed=10342 ms frames_in=622 bytes_in=79616 played=622 (~9679 ms) preroll=300 ms reached=yes@312 ms underruns=2 gap_silence=420 ms lead_silence=312 ms max_frame_gap=388 ms max_ble_write_gap=391 ms peak=3840 B (467 ms) overflows=0 late=0 i2s_blocked=0 ms discarded=0 drain=331 ms ble=yes interval=15.00 ms latency=0 mtu=247 dle=251/251 heap=61234 min=48890
+TX summary: keyed=10652 ms frames_in=161 bytes_in=82432 played=161 (~10022 ms) preroll=300 ms reached=yes@312 ms underruns=0 gap_silence=0 ms lead_silence=312 ms max_frame_gap=81 ms max_ble_write_gap=45 ms peak=2560 B (311 ms) overflows=0 late=0 i2s_blocked=0 ms discarded=0 drain=331 ms ble=yes interval=15.00 ms latency=0 mtu=247 dle=251/251 heap=53042 min=40698 credit_held=0 B
 ```
+
+The fields and their order are those of the first version, with
+`credit_held` appended at the end, so parsers that split on spaces and `=`
+keep working.
 
 | Field | Meaning |
 | --- | --- |
 | `keyed` | Time in TX mode (includes pre-roll and drain) |
 | `frames_in`, `bytes_in` | TX audio frames and payload bytes received |
-| `played` | Frames played out, with the audio time they represent |
+| `played` | Frames played out in full, with the decoded audio time actually written to the DAC (real duration, whatever the frame size) |
 | `preroll`, `reached` | Pre-roll target, and when playout first started after keying |
 | `underruns` | Times the buffer ran dry while playing |
 | `gap_silence` | Silence inserted mid-transmission (underruns and re-pre-roll): **the audible dropouts** |
@@ -256,15 +325,17 @@ TX summary: keyed=10342 ms frames_in=622 bytes_in=79616 played=622 (~9679 ms) pr
 | `max_frame_gap` | Longest gap between two TX audio frames reaching the buffer |
 | `max_ble_write_gap` | Longest gap between two GATT writes from the phone (BLE starvation) |
 | `peak` | Highest buffer fill, in bytes and audio time |
-| `overflows` | Frames that did not fit and forced an early play (host overran the window) |
+| `overflows` | Frames that did not fit and forced an early play (host overran its credit) |
 | `late` | Times the main loop fell behind the DAC |
 | `i2s_blocked` | Time spent in I2S writes that took over 6 ms, i.e. waited for a DMA buffer (should be 0; growth means the DAC runs slower than the pacing model) |
 | `discarded` | Frames still buffered when TX ended without a drain (watchdog, timeout, retune) |
 | `drain` | Time between PTT release and unkey |
 | `ble`, `interval`, `latency`, `mtu`, `dle` | Link state at the end of the transmission |
 | `heap`, `min` | Free heap now and the lowest it has been since boot |
+| `credit_held` | Most flow-control credit held back at once; 0 when the host sent in real time, up to one window after a burst |
 
-A clean over has `underruns=0 gap_silence=0 overflows=0 late=0 i2s_blocked=0 ms discarded=0`.
+A clean over has `underruns=0 gap_silence=0 overflows=0 late=0 i2s_blocked=0 ms discarded=0`,
+and `played` close to `keyed` minus `lead_silence` and the ~50 ms DMA tail.
 Headset starvation shows up as a large `max_ble_write_gap` and, once a gap
 exceeds what the buffer holds, as `underruns` and `gap_silence`.
 
@@ -323,8 +394,12 @@ a normal build.
    reported.
 4. **Baseline, no headset.** Five overs of about 10 s each, with any sound into
    the phone mic. Expect per over: `underruns=0 gap_silence=0 overflows=0
-   late=0 i2s_blocked=0 ms discarded=0`, `reached` near 300 ms, `drain` about 300 to 400 ms,
-   `max_ble_write_gap` well under 100 ms.
+   late=0 i2s_blocked=0 ms discarded=0 credit_held=0 B`, `reached` near
+   300 ms, `drain` about 300 to 400 ms (the tail is played even when the host
+   resets emphasis in a second write after the release), `played` close to
+   `keyed` minus `lead_silence`, and `max_ble_write_gap` well under 100 ms. On
+   the host side, the credit rate from the first WINDOW_UPDATE should read as
+   real time (pgpilot: no starvation verdict, no fallback).
 5. **Headset mic open (HFP/SCO active).** Repeat ten overs of 10 s, with the
    headset as the input. Record `max_ble_write_gap`, `max_frame_gap`,
    `underruns`, `gap_silence` and the `BLE link` interval. This is the
@@ -333,9 +408,10 @@ a normal build.
    `gap_silence` with the gaps the old firmware produced (old firmware: every
    gap longer than about 64 ms was audible).
 6. **Record-then-send fallback.** Five overs in the app's fallback mode. Expect
-   `reached` well under 300 ms, `peak` close to one window of audio (about
-   3.3 to 3.8 KB, 400 to 470 ms), `overflows=0`, `underruns=0`, and `keyed` about equal
-   to the recording length plus pre-roll and drain.
+   `reached` at or under 300 ms, `peak` up to the buffer size (up to about
+   8 KB, 1 s), `credit_held` up to about one window (4 KB), `overflows=0`,
+   `underruns=0`, `i2s_blocked=0 ms`, and `keyed` about equal to the recording
+   length plus pre-roll and drain (`drain` up to about 1 s).
 7. **Long over.** One 60 s over with the headset. Expect `late=0` and
    `i2s_blocked=0 ms` (this is the clock-drift check) and a stable `heap`/`min`.
 8. **Release during drain.** Release PTT and press it again within 300 ms,
