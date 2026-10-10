@@ -84,7 +84,10 @@ public:
     int64_t start = esp_timer_get_time();
     size_t written = target.write(data, len);
     int64_t took = esp_timer_get_time() - start;
-    if (took > 2000) {
+    // A mono frame is written one sample at a time by the I2S wrapper, which
+    // costs a few ms of CPU on its own; only count waits for a DMA buffer
+    // (up to ~11 ms each).
+    if (took > 6000) {
       blockedUs += (uint64_t)took;
     }
     return written;

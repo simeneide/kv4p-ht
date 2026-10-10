@@ -209,7 +209,7 @@ the DAC's pace:
   transmitter is off.
 * **FreeDV 2400B and AX.25** do not use this path, and AX.25 packets get no
   summary line.
-* **Feature bit.** HELLO advertises `FEATURE_HAS_TX_JITTER_BUFFER` (bit 4) so
+* **Feature bit.** HELLO advertises `FEATURE_HAS_TX_JITTER_BUFFER` (bit 7, chosen to stay clear of upstream's next allocations until agreed) so
   hosts can tell which behaviour they are talking to. Existing hosts ignore
   unknown bits.
 
@@ -258,7 +258,7 @@ TX summary: keyed=10342 ms frames_in=622 bytes_in=79616 played=622 (~9679 ms) pr
 | `peak` | Highest buffer fill, in bytes and audio time |
 | `overflows` | Frames that did not fit and forced an early play (host overran the window) |
 | `late` | Times the main loop fell behind the DAC |
-| `i2s_blocked` | Time spent blocked in `i2s_write` (should be 0; growth means the DAC runs slower than the pacing model) |
+| `i2s_blocked` | Time spent in I2S writes that took over 6 ms, i.e. waited for a DMA buffer (should be 0; growth means the DAC runs slower than the pacing model) |
 | `discarded` | Frames still buffered when TX ended without a drain (watchdog, timeout, retune) |
 | `drain` | Time between PTT release and unkey |
 | `ble`, `interval`, `latency`, `mtu`, `dle` | Link state at the end of the transmission |
