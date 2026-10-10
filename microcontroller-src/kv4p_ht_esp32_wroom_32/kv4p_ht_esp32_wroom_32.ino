@@ -24,6 +24,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "globals.h"
 #include "debug.h"
 #include "BluedroidBleKissGattStream.h"
+#include "resetDiagnostics.h"
 #include "led.h"
 #include "protocol.h"
 #include "state.h"
@@ -373,6 +374,7 @@ void setMode(Mode newMode) {
 }
 
 void setup() {
+  resetDiagnosticsBegin();
   boardSetup();
   loadPersistedRadioState();
   // Communication with Android via USB cable
@@ -386,6 +388,7 @@ void setup() {
   Serial.println("You will see watchdog resets — this is expected behavior.");
   Serial.println("Use `logcat` or a kv4p decoder to view readable logs.");
   Serial.println("More info: https://github.com/VanceVagell/kv4p-ht/blob/main/microcontroller-src/kv4p_ht_esp32_wroom_32/readme.md");
+  printResetDiagnostics(Serial);
   Serial.println("==============================");
   char bluetoothDeviceName[12];
   formatBluetoothDeviceName(bluetoothDeviceName, sizeof(bluetoothDeviceName));
@@ -434,6 +437,7 @@ void setup() {
     reconcileDesiredState(false);
   }
   sendHello(protocolUsbSession, FIRMWARE_VER, radioModuleStatus, hw.rfModuleType, moduleMinRadioFreq(), moduleMaxRadioFreq(), getFirmwareFeatures(), currentDeviceState(protocolUsbSession.flags));
+  sendResetDiagnostics(Serial);
   _LOGI("Setup is finished");
 }
 
@@ -685,6 +689,8 @@ void bluetoothLoop() {
     protocolBtSession.connected = true;
     bluetoothParser.reset();
     sendHello(protocolBtSession, FIRMWARE_VER, radioModuleStatus, hw.rfModuleType, moduleMinRadioFreq(), moduleMaxRadioFreq(), getFirmwareFeatures(), currentDeviceState(protocolBtSession.flags));
+    sendResetDiagnostics(*protocolBtSession.stream);
+    sendResetDiagnostics(Serial);  // Also on USB, for bench logging.
   } else if (!connected && bluetoothProtocolConnected) {
     bluetoothProtocolConnected = false;
     protocolBtSession.connected = false;
@@ -708,6 +714,8 @@ void bleKissLoop() {
   if (protocolReady && !bleKissProtocolConnected) {
     bleKissParser.reset();
     sendHello(protocolBleSession, FIRMWARE_VER, radioModuleStatus, hw.rfModuleType, moduleMinRadioFreq(), moduleMaxRadioFreq(), getFirmwareFeatures(), currentDeviceState(protocolBleSession.flags));
+    sendResetDiagnostics(bleKissStream);
+    sendResetDiagnostics(Serial);  // Also on USB, for bench logging.
     bleKissProtocolConnected = true;
     protocolBleSession.connected = true;
     _LOGI("BLE KISS sent HELLO after notify subscription: firmware=%u window=%u", FIRMWARE_VER, BLE_KISS_WINDOW_SIZE);
@@ -738,6 +746,7 @@ void squelchLoop() {
 }
 
 void loop() {
+  resetDiagnosticsLoop(mode == MODE_TX, (desiredState.flags & HOST_STATE_HIGH_POWER) != 0, millis() - txStartTime);
   squelchLoop();
   debugLoop();
   ledLoop();
