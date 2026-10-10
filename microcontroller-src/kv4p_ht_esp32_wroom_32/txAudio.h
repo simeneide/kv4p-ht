@@ -42,17 +42,26 @@ static constexpr uint32_t TX_PREROLL_USB_MS = 40;
 // never stops: a buffer is refilled only when we write, otherwise the DAC
 // replays whatever it held last (auto_clear is off). A write only proceeds
 // without blocking into buffers the DAC has finished, so playout is paced by
-// the clock: write a frame once a frame plus one DMA buffer has been consumed
+// the clock: write one chunk once a chunk plus one DMA buffer has been consumed
 // (the extra buffer keeps i2s_write from ever waiting). Written audio reaches
 // the DAC about 40 to 55 ms later.
+//
+// Host frames vary in size (one 128-byte ADPCM block from the Android app,
+// four blocks, ~62 ms, from pgpilot), and a 62 ms frame would not fit the
+// 64 ms ring without waiting. So playout is done one ADPCM block (one chunk)
+// at a time, whatever the frame size; a chunk decodes to at most
+// AUDIO_FRAME_SAMPLES_WIRE samples. The pacing counts the PCM actually
+// written, so it follows the real decoded length either way.
 static constexpr int TX_DMA_BUFFER_COUNT = 6;
 static constexpr int64_t TX_DMA_BUFFER_SAMPLES_48K = 512;
 static constexpr int64_t TX_DMA_RING_SAMPLES_48K = TX_DMA_BUFFER_COUNT * TX_DMA_BUFFER_SAMPLES_48K;
-static constexpr int64_t TX_PLAYOUT_WRITE_DEFICIT_48K = AUDIO_FRAME_SAMPLES_48K + TX_DMA_BUFFER_SAMPLES_48K;
+static constexpr size_t TX_PLAYOUT_CHUNK_BYTES = AUDIO_FRAME_BYTES;
+static constexpr int64_t TX_PLAYOUT_CHUNK_SAMPLES_48K = AUDIO_FRAME_SAMPLES_48K;
+static constexpr int64_t TX_PLAYOUT_WRITE_DEFICIT_48K = TX_PLAYOUT_CHUNK_SAMPLES_48K + TX_DMA_BUFFER_SAMPLES_48K;
 // If the loop falls this far behind, the DAC has started replaying old
 // buffers. Do not try to make up the lost time; resume as if one frame late.
 static constexpr int64_t TX_PLAYOUT_STALE_SAMPLES_48K = TX_DMA_RING_SAMPLES_48K - TX_DMA_BUFFER_SAMPLES_48K;
-static constexpr int64_t TX_PLAYOUT_RESYNC_DEFICIT_48K = TX_PLAYOUT_WRITE_DEFICIT_48K + AUDIO_FRAME_SAMPLES_48K;
+static constexpr int64_t TX_PLAYOUT_RESYNC_DEFICIT_48K = TX_PLAYOUT_WRITE_DEFICIT_48K + TX_PLAYOUT_CHUNK_SAMPLES_48K;
 static_assert(TX_PLAYOUT_RESYNC_DEFICIT_48K < TX_PLAYOUT_STALE_SAMPLES_48K, "resync point must be below the stale point");
 // Time for the last written frame to leave the DMA ring, plus margin.
 static constexpr uint32_t TX_PLAYOUT_FLUSH_US =
@@ -186,6 +195,7 @@ struct TxPlayoutStats {
   uint32_t endMs = 0;
   uint32_t leadSilenceSamplesWire = 0;  // Silence before the first audio (pre-roll).
   uint32_t gapSilenceSamplesWire = 0;   // Silence filling underruns mid-transmission.
+  uint64_t playedSamples48k = 0;        // Decoded voice actually written to I2S.
   uint32_t lateTicks = 0;           // The main loop fell behind the DAC (DMA ran dry).
   uint32_t framesDiscardedAtEnd = 0;
   uint32_t drainMs = 0;
@@ -295,7 +305,9 @@ void endI2STx() {
 }
 
 static void txDecode(const uint8_t *src, size_t len) {
+  uint64_t before = txOutCounter.bytes;
   txDecodeStream.write(src, len);
+  txPlayout.playedSamples48k += (txOutCounter.bytes - before) / sizeof(int16_t);
 }
 
 static void txAfterAudioWrite() {
@@ -309,9 +321,10 @@ static void txPlayFrame(const uint8_t *src, size_t len) {
   txAfterAudioWrite();
 }
 
-static void txPlayOldest() {
+// Play the next chunk (at most one ADPCM block) of the oldest frame.
+static void txPlayChunk() {
   TxJitterEntry meta;
-  if (txJitter.pop(txDecode, meta) > 0) {
+  if (txJitter.popChunk(txDecode, TX_PLAYOUT_CHUNK_BYTES, meta) > 0) {
     txAfterAudioWrite();
     txQueueCredit(meta);
   }
@@ -428,7 +441,7 @@ void processTxAudio(ProtocolSession &session, uint8_t *src, size_t len) {
     // The host sent more than its window. Play the oldest frame early
     // (blocking on I2S if needed) rather than dropping audio: dropping part of
     // the ADPCM byte stream would misalign every block after it.
-    txPlayOldest();
+    txPlayChunk();
   }
   txFlushCredits();
   esp_task_wdt_reset();
@@ -463,7 +476,7 @@ void txPlayoutLoop() {
   // A few frames at most per call, so catching up never stalls the main loop.
   for (int i = 0; i < 4 && deficit >= TX_PLAYOUT_WRITE_DEFICIT_48K; i++) {
     if (txJitter.shouldPlay(now, creditPressure, txPlayout.releasePending)) {
-      txPlayOldest();
+      txPlayChunk();
     } else {
       // Explicit silence: with auto_clear off the DMA would otherwise loop
       // over its last buffers, which is the stutter this buffer exists to fix.

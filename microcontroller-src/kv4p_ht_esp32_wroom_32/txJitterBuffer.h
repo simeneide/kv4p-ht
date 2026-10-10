@@ -168,19 +168,21 @@ public:
     }
   }
 
-  // Remove the oldest frame, handing its payload to sink(const uint8_t *, size_t)
-  // in at most two contiguous pieces (the ring may wrap), so no copy buffer is
-  // needed. meta receives its ack information. Returns the payload length.
+  // Consume up to maxBytes of the oldest frame, handing them to
+  // sink(const uint8_t *, size_t) in at most two contiguous pieces (the ring
+  // may wrap), so no copy buffer is needed. Returns the bytes consumed. When
+  // this finishes the frame, meta receives its ack information (the credit
+  // still held for it); otherwise meta.ackBytes is 0. meta.len is the number
+  // of payload bytes the frame had left before this call.
   template <typename Sink>
-  size_t pop(Sink &&sink, Entry &meta) {
-    if (_count == 0) {
+  size_t popChunk(Sink &&sink, size_t maxBytes, Entry &meta) {
+    meta = Entry{nullptr, 0, 0};
+    if (_count == 0 || maxBytes == 0) {
       return 0;
     }
-    meta = _entries[_head];
-    _head = (_head + 1) % CAPACITY_ENTRIES;
-    --_count;
-    _heldAckBytes -= meta.ackBytes;
-    size_t len = meta.len;
+    Entry &head = _entries[_head];
+    meta.len = head.len;
+    size_t len = head.len < maxBytes ? head.len : maxBytes;
     size_t first = CAPACITY_BYTES - _byteHead;
     if (first > len) first = len;
     sink(&_bytes[_byteHead], first);
@@ -189,8 +191,22 @@ public:
     }
     _byteHead = (_byteHead + len) % CAPACITY_BYTES;
     _byteCount -= len;
-    ++_stats.framesOut;
+    head.len = (uint16_t)(head.len - len);
+    if (head.len == 0) {
+      meta.ackTag = head.ackTag;
+      meta.ackBytes = head.ackBytes;
+      _heldAckBytes -= head.ackBytes;
+      _head = (_head + 1) % CAPACITY_ENTRIES;
+      --_count;
+      ++_stats.framesOut;
+    }
     return len;
+  }
+
+  // Remove what is left of the oldest frame, as popChunk.
+  template <typename Sink>
+  size_t pop(Sink &&sink, Entry &meta) {
+    return popChunk(sink, (size_t)0xFFFF, meta);
   }
 
   // Remove the oldest frame without using its payload.

@@ -455,7 +455,8 @@ void logBleLinkInfo(const char *prefix) {
 void logTxSummary() {
   const auto &js = txJitter.stats();
   uint32_t keyedMs = txPlayout.endMs - txPlayout.startMs;
-  uint32_t audioMs = (uint32_t)((uint64_t)js.framesOut * AUDIO_FRAME_SAMPLES_WIRE * 1000 / AUDIO_WIRE_SAMPLE_RATE);
+  // Decoded voice actually written, so it is right for any host frame size.
+  uint32_t audioMs = (uint32_t)(txPlayout.playedSamples48k * 1000 / AUDIO_SAMPLE_RATE);
   Kv4pBleKissStream::LinkInfo link = bleKissStream.linkInfo();
   debug_log_printf(COMMAND_DEBUG_INFO,
                    "TX summary: keyed=%lu ms frames_in=%lu bytes_in=%lu played=%lu (~%lu ms) preroll=%lu ms "
