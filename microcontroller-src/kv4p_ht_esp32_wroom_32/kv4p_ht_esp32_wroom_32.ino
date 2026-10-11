@@ -366,7 +366,9 @@ void setMode(Mode newMode) {
     case MODE_TX:
       _LOGI("MODE_TX");
       txStartTime = millis();
+#ifndef KV4P_BENCH_NO_RF
       digitalWrite(hw.pins.pinPtt, LOW);
+#endif
       endI2SRx();
       initI2STx();
     break;
@@ -387,6 +389,9 @@ void setup() {
   Serial.println("You will see watchdog resets — this is expected behavior.");
   Serial.println("Use `logcat` or a kv4p decoder to view readable logs.");
   Serial.println("More info: https://github.com/VanceVagell/kv4p-ht/blob/main/microcontroller-src/kv4p_ht_esp32_wroom_32/readme.md");
+#ifdef KV4P_BENCH_NO_RF
+  Serial.println("BENCH BUILD: the radio module is never keyed (KV4P_BENCH_NO_RF). Not for use.");
+#endif
   Serial.println("==============================");
   char bluetoothDeviceName[12];
   formatBluetoothDeviceName(bluetoothDeviceName, sizeof(bluetoothDeviceName));
