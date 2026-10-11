@@ -66,7 +66,11 @@ public:
   int available() override { return 0; }
   int read() override { return -1; }
   int peek() override { return -1; }
-  size_t write(uint8_t) override { return 1; }
+  size_t write(uint8_t) override {
+    bytesWritten++;
+    return 1;
+  }
+  size_t bytesWritten = 0;  // Lets tests check what reaches the USB port.
 };
 
 inline NativeSerial Serial;

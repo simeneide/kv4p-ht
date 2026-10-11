@@ -326,7 +326,13 @@ summary (`heap`, `min`).
 
 When a voice transmission ends, one `COMMAND_DEBUG_INFO` line is sent to
 every connected session including USB, in release builds as well (values
-illustrative, a 10 s pgpilot over with 512 B frames):
+illustrative, a 10 s pgpilot over with 512 B frames). USB always gets it: the
+USB session counts as connected from boot, debug lines are written to the USB
+port before any Bluetooth session and are not gated by session flags, a host
+handshake or the build's log level (`debug_log_printf()` is called directly,
+not through the `_LOG*` macros that release builds compile out). The same
+holds for the `BLE link` lines and the `Reset reason` line repeated on every
+Bluetooth connect.
 
 ```
 TX summary: keyed=10652 ms frames_in=161 bytes_in=82432 played=161 (~10022 ms) preroll=300 ms reached=yes@312 ms underruns=0 gap_silence=0 ms lead_silence=312 ms max_frame_gap=81 ms max_ble_write_gap=45 ms peak=2560 B (311 ms) overflows=0 late=0 i2s_blocked=0 ms discarded=0 drain=331 ms ble=yes interval=15.00 ms latency=0 mtu=247 dle=251/251 heap=53042 min=40698 credit_held=0 B carrier_lead=300 ms
@@ -362,6 +368,21 @@ A clean over has `underruns=0 gap_silence=0 overflows=0 late=0 i2s_blocked=0 ms 
 and `played` close to `keyed` minus `lead_silence` and the ~50 ms DMA tail.
 Headset starvation shows up as a large `max_ble_write_gap` and, once a gap
 exceeds what the buffer holds, as `underruns` and `gap_silence`.
+
+**If the USB log goes quiet while the radio keeps working over Bluetooth**,
+the firmware is still writing (see above), so look at the UART to USB path.
+On one release-build run with RF the capture stopped right after the first
+`BLE link: connected=0` line and never received another byte, not even the
+`Reset reason` line that is sent to USB on every Bluetooth connect, while the
+logger sat in `select()` with the CP2102 still enumerated; the same commit's
+bench build had logged every summary on the same setup without RF. To tell a
+stalled bridge from a firmware problem: stop the logger, start it again
+without `--reset`, and reconnect the phone. A `Reset reason` line with the
+same boot number means the bridge had stalled and the radio never restarted;
+a new boot number means it restarted. If nothing arrives even then, the
+bridge needs a replug (which power-cycles a radio powered from that cable).
+Keep the USB cable away from the
+antenna, and use low power into a dummy load when the log matters.
 
 ## 5. Fragmented ACL reassembly (#472) and the IDF upgrade path
 

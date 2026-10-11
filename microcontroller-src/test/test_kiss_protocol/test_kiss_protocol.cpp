@@ -479,6 +479,28 @@ void test_send_kiss_data_frame_broadcasts_to_connected_secondary_stream() {
   protocolBtSession = oldBtSession;
 }
 
+// Debug lines (TX summary, BLE link, reset reason) must reach the USB port
+// even when the host is on BLE and nothing on USB has sent a handshake or set
+// any session flag: a USB logger only listens.
+void test_debug_frames_reach_usb_while_a_ble_session_is_active() {
+  FakeStream ble;
+  ProtocolSession oldUsbSession = protocolUsbSession;
+  ProtocolSession oldBleSession = protocolBleSession;
+  protocolUsbSession.flags = 0;
+  protocolUsbSession.windowSize = 0;
+  protocolBleSession = { &ble, true, HOST_STATE_ENABLE_STATUS_REPORTS | HOST_STATE_RX_AUDIO_OPEN, 4096, 0 };
+  const char line[] = "TX summary: keyed=1000 ms";
+  size_t usbBefore = Serial.bytesWritten;
+
+  sendKv4pVendorFrame(COMMAND_DEBUG_INFO, (const uint8_t *)line, sizeof(line) - 1);
+
+  TEST_ASSERT_TRUE(ble.writtenLen() > sizeof(line));
+  TEST_ASSERT_EQUAL(ble.writtenLen(), Serial.bytesWritten - usbBefore);
+
+  protocolUsbSession = oldUsbSession;
+  protocolBleSession = oldBleSession;
+}
+
 void test_send_kv4p_vendor_frame_escapes_payload() {
   FakeStream stream;
   const uint8_t payload[] = { 0x11, KISS_FEND, KISS_FESC };
@@ -632,6 +654,7 @@ static int runKissProtocolTests() {
   RUN_TEST(test_oversized_frame_is_dropped_and_recovers);
   RUN_TEST(test_send_kiss_data_frame_escapes_fend_and_fesc);
   RUN_TEST(test_send_kiss_data_frame_broadcasts_to_connected_secondary_stream);
+  RUN_TEST(test_debug_frames_reach_usb_while_a_ble_session_is_active);
   RUN_TEST(test_send_kv4p_vendor_frame_escapes_payload);
   RUN_TEST(test_send_audio_routes_only_to_rx_audio_open_sessions);
   RUN_TEST(test_global_freedv_mode_selects_digital_routing);
