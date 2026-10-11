@@ -53,13 +53,14 @@ Where it is reported:
 Example lines (values illustrative):
 
 ```
-Reset reason: PANIC; prev keyed=1 high=1 keyed_for=6120ms up=734120ms; boot #4; Exception/Panic Reset
+Reset reason: PANIC; prev keyed=1 high=1 keyed_for=6120ms up=734120ms; boot #4; fw 18 pgpilot; Exception/Panic Reset
 Core dump: 11364 bytes at 0x3f0000, task=BTC_TASK pc=0x400d6a1c exccause=29 excvaddr=0x00000002 elf=1a2b3c4d5e6f7a8b bt=0x400d6a1c,0x400d6b80,...
 ```
 
 The first line keeps the wording "Reset reason" that hosts may already look
 for (pgpilot matches it and keeps the first 120 characters, so the keyed state
-comes first). The protocol is unchanged. Upstream issue #473
+comes first, and the firmware label, section 6, sits before the long
+description). The protocol is unchanged. Upstream issue #473
 suggested a separate debug GATT characteristic for richer BLE diagnostics, and
 that is still open; these lines only use the debug log channel that already
 exists.
@@ -413,6 +414,47 @@ The proper fix is a newer Bluedroid. What that would take:
 * Alternatives: backport the small Apache-2.0 fixes into a custom IDF 4.4 build
   of the Arduino libraries (esp32-arduino-lib-builder), or use NimBLE for BLE in
   a BLE-only build (Classic SPP needs Bluedroid).
+
+## 6. Version 18 and the firmware label
+
+Files: `firmwareVersion.h`, `tools/set_app_version.py`, `platformio.ini`.
+
+This fork reports `FIRMWARE_VER = 18` in HELLO (upstream is 17), and names
+itself `18 pgpilot` (`FIRMWARE_LABEL`) in three places:
+
+* the USB boot banner (`Firmware 18 pgpilot (pgpilot fork: ...)`),
+* the per-connect `Reset reason` debug line (`...; boot #4; fw 18 pgpilot; ...`),
+  placed before the long description so it survives a host that keeps only
+  the first 120 characters,
+* the ESP-IDF app descriptor in `firmware.bin`. Arduino-ESP32 links a
+  precompiled descriptor, so every image otherwise says version
+  `esp-idf: v4.4.7 ...` and project `arduino-lib-builder`. The post-link
+  script rewrites the descriptor's `version` to the label and `project_name`
+  to `kv4p-ht-pgpilot` in the ELF, before `elf2image`, so the image checksum
+  and hashes stay valid. `esptool.py --chip esp32 image_info --version 2
+  firmware.bin` then shows `App version: 18 pgpilot`. The compile time and
+  date fields still come from the precompiled library.
+
+Only the version number changes on the wire; the HELLO layout, the features
+byte (bit 7 already advertises the TX jitter buffer) and every command are as
+before.
+
+Compatibility of the number 18:
+
+* **Upstream Android app.** `RadioAudioService.validateHello()` only rejects
+  firmware *older* than `FirmwareUtils.PACKAGED_FIRMWARE_VER` (17); there is no
+  "firmware newer than app" check, so 18 connects normally. Its Settings screen
+  shows "18". It never offers to flash automatically when the radio is newer,
+  but flashing from that app installs its packaged 17, which removes this
+  fork's changes.
+* **pgpilot.** Treats any version at or above its default set (17) as up to
+  date, so a radio on 18 is not prompted to downgrade. It ships this build as
+  an opt-in beta set on its flasher.
+* **The firmware itself** uses `FIRMWARE_VER` only in HELLO and one log line.
+
+When upstream releases its own 18, the numbers will collide. The label and
+the app descriptor still tell the two apart; bump the fork past upstream
+before the next tag if that happens.
 
 ## Bench test plan
 

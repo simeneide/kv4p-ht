@@ -1,5 +1,7 @@
 # kv4p-ht
 
+> **This is the pgpilot fork** (firmware `18 pgpilot`, branch `pgpilot/ble-robust`). It changes only the ESP32 firmware, for steadier audio over Bluetooth LE and restart diagnostics. GPL-3.0 like upstream; the source of every binary pgpilot ships is the tag it was built from. See [PGPILOT.md](PGPILOT.md).
+
 Open source handheld ham radio project kv4p HT
 
 Please see the main project site: https://kv4p.com

@@ -41,6 +41,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <esp_attr.h>
 #include <esp_core_dump.h>
 #include "protocol.h"
+#include "firmwareVersion.h"
 
 struct ResetBreadcrumb {
   uint32_t magic;
@@ -148,16 +149,18 @@ void resetDiagnosticsUpdate(bool keyed, bool highPower, uint32_t keyedForMs) {
 }
 
 // Formats "Reset reason: ..." (the wording hosts already look for). The most
-// useful fields come first: some hosts keep only the first 120 characters.
+// useful fields come first: some hosts keep only the first 120 characters, so
+// the firmware label goes before the long description, which only restates
+// the reason name.
 int formatResetReasonLine(char *out, size_t outSize) {
   int n;
   if (previousBreadcrumbValid) {
-    n = snprintf(out, outSize, "Reset reason: %s; prev keyed=%u high=%u keyed_for=%lums up=%lums; boot #%lu; %s",
+    n = snprintf(out, outSize, "Reset reason: %s; prev keyed=%u high=%u keyed_for=%lums up=%lums; boot #%lu; fw " FIRMWARE_LABEL "; %s",
                  resetReasonName(bootResetReason), previousBreadcrumb.keyed, previousBreadcrumb.highPower,
                  (unsigned long)previousBreadcrumb.keyedForMs, (unsigned long)previousBreadcrumb.uptimeMs,
                  (unsigned long)resetBreadcrumb.bootCount, resetReasonDescription(bootResetReason));
   } else {
-    n = snprintf(out, outSize, "Reset reason: %s; boot #%lu; %s", resetReasonName(bootResetReason),
+    n = snprintf(out, outSize, "Reset reason: %s; boot #%lu; fw " FIRMWARE_LABEL "; %s", resetReasonName(bootResetReason),
                  (unsigned long)resetBreadcrumb.bootCount, resetReasonDescription(bootResetReason));
   }
   return n;

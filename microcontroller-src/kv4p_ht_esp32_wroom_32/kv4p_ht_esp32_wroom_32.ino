@@ -22,6 +22,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include "globals.h"
+#include "firmwareVersion.h"
 #include "debug.h"
 #include "BluedroidBleKissGattStream.h"
 #include "resetDiagnostics.h"
@@ -35,8 +36,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "buttons.h"
 #include "utils.h"
 #include "board.h"
-
-const uint16_t FIRMWARE_VER = 17;
 
 const uint32_t RSSI_REPORT_INTERVAL_MS = 100;
 const uint32_t DEVICE_STATE_REPORT_INTERVAL_MS = 500;
@@ -491,6 +490,7 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println("===== kv4p serial output =====");
+  Serial.println("Firmware " FIRMWARE_LABEL " (pgpilot fork: https://github.com/simeneide/kv4p-ht)");
   Serial.println("This port will emit binary data using the kv4p protocol.");
   Serial.println("You will see watchdog resets — this is expected behavior.");
   Serial.println("Use `logcat` or a kv4p decoder to view readable logs.");

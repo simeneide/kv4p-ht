@@ -1,0 +1,47 @@
+# The pgpilot fork of kv4p-ht
+
+This repository is a fork of [VanceVagell/kv4p-ht](https://github.com/VanceVagell/kv4p-ht),
+maintained for [pgpilot](https://pgpilot.app), a paragliding app that uses a
+kv4p HT as a VHF radio over Bluetooth. Its firmware branch is
+`pgpilot/ble-robust`, and the firmware calls itself **18 pgpilot**
+(`FIRMWARE_VER = 18`).
+
+## What it changes
+
+Firmware only (`microcontroller-src/`); the Android app is untouched. The
+changes are aimed at upstream and are described in detail in
+[microcontroller-src/docs/ble-robustness.md](microcontroller-src/docs/ble-robustness.md):
+
+* Reports why the radio restarted (reset reason, a breadcrumb saying whether it
+  was transmitting, and a core dump summary) at boot and on every connect.
+* Requests LE data length 251 and iOS-friendly BLE connection parameters.
+* Buffers TX audio from the host and plays it out at the DAC's pace, so a
+  congested Bluetooth link (for example with a headset microphone open) gives
+  steady audio instead of dropouts. Advertised with HELLO feature bit 7.
+* Cleaner start and end of each transmission: the first audio waits until the
+  module has keyed, and the tail drains before unkey.
+* Names the build `18 pgpilot` in the boot banner, the reset reason line and
+  the ESP-IDF app descriptor.
+
+The HELLO layout and every command are unchanged; only the version number
+differs from upstream 17. The upstream Android app accepts it (it only rejects
+older firmware).
+
+## License and source
+
+GPL-3.0, like upstream (see [LICENSE](LICENSE)). The exact source of each
+binary pgpilot distributes is the tag it was built from, for example
+[`v18-pgpilot.1`](https://github.com/simeneide/kv4p-ht/tree/v18-pgpilot.1).
+To rebuild it:
+
+```sh
+git clone https://github.com/simeneide/kv4p-ht.git
+cd kv4p-ht
+git checkout v18-pgpilot.1
+cd microcontroller-src
+pio run -e esp32dev-release
+```
+
+The images are in `.pio/build/esp32dev-release/` (`bootloader.bin`,
+`partitions.bin`, `firmware.bin`; `boot_app0.bin` comes from the
+Arduino-ESP32 framework package).
