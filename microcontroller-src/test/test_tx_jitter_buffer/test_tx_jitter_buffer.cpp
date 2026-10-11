@@ -410,6 +410,117 @@ void test_repress_during_drain_continues_the_same_over() {
   TEST_ASSERT_EQUAL_UINT32(0, b.stats().prerollReachedMs);
 }
 
+// --- Carrier lead time ---
+
+static constexpr uint32_t LEAD_MS = 300;
+
+static BigBuffer makeLeadBuffer(uint32_t prerollMs, uint32_t leadMs) {
+  BigBuffer b(16000, 249, 128);
+  b.reset(0, prerollMs, leadMs);  // Keyed at t = 0.
+  return b;
+}
+
+void test_burst_fill_waits_for_carrier_lead() {
+  // Record-then-send over BLE: the host keys and sends 512 B frames as fast as
+  // credit allows, so the 300 ms pre-roll is buffered about 40 ms after keying.
+  BigBuffer b = makeLeadBuffer(300, LEAD_MS);
+  auto f = bigFrame(1);
+  size_t hostCredit = BLE_WINDOW;
+  uint32_t t = 10;
+  int sent = 0;
+  while (hostCredit >= BIG_ACK) {
+    hostCredit -= BIG_ACK;
+    TEST_ASSERT_TRUE_MESSAGE(b.push(f.data(), f.size(), &SESSION_A, BIG_ACK, t), "host overran the buffer");
+    hostCredit += b.releaseCredit(&SESSION_A, BLE_WINDOW);
+    sent++;
+    if (sent == 5) {
+      // Five frames (311 ms) within about 40 ms: the pre-roll level is reached ...
+      TEST_ASSERT_TRUE(t <= 40);
+      TEST_ASSERT_TRUE(b.bufferedMs() >= 300);
+      // ... but nothing plays yet, whatever the trigger.
+      TEST_ASSERT_FALSE(b.shouldPlay(t, false, false));
+      TEST_ASSERT_FALSE(b.shouldPlay(t, true, false));
+      TEST_ASSERT_FALSE(b.shouldPlay(t, false, true));
+    }
+    t += 7;
+  }
+  // The buffer kept filling while waiting, bounded by free space and credit.
+  TEST_ASSERT_TRUE(sent > 5);
+  TEST_ASSERT_EQUAL_UINT32(0, b.stats().overflows);
+  TEST_ASSERT_TRUE(hostCredit <= b.freeBytes());
+  TEST_ASSERT_FALSE(b.shouldPlay(LEAD_MS - 1, true, true));
+  TEST_ASSERT_FALSE(b.playing());
+  TEST_ASSERT_FALSE(b.stats().prerollReached);
+  // First play exactly at the lead time.
+  TEST_ASSERT_TRUE(b.shouldPlay(LEAD_MS, false, false));
+  TEST_ASSERT_TRUE(b.stats().prerollReached);
+  TEST_ASSERT_EQUAL_UINT32(LEAD_MS, b.stats().prerollReachedMs);
+}
+
+// First playout time for a host that keys and then sends one 128-byte block
+// (15.5625 ms) in real time, the first one firstFrameMs after keying.
+static uint32_t firstPlayLiveMs(uint32_t prerollMs, uint32_t leadMs, uint32_t firstFrameMs) {
+  BigBuffer b = makeLeadBuffer(prerollMs, leadMs);
+  auto f = block(1);
+  uint32_t pushed = 0;
+  for (uint32_t t = 0; t < 2000; t++) {
+    while (firstFrameMs + (pushed * 15563) / 1000 <= t) {
+      b.push(f.data(), f.size(), &SESSION_A, 137, t);
+      b.releaseCredit(&SESSION_A, BLE_WINDOW);
+      pushed++;
+    }
+    if (b.shouldPlay(t, false, false)) {
+      return t;
+    }
+  }
+  return UINT32_MAX;
+}
+
+void test_live_fill_is_not_delayed_by_carrier_lead() {
+  // A live host fills the 300 ms pre-roll in real time, so the lead has
+  // (almost) always passed by then: the start time is the later of the two,
+  // never more than max(lead, pre-roll) after the first frame plus one block.
+  for (uint32_t firstFrameMs : {0u, 5u, 20u, 60u}) {
+    uint32_t without = firstPlayLiveMs(300, 0, firstFrameMs);
+    uint32_t with = firstPlayLiveMs(300, LEAD_MS, firstFrameMs);
+    TEST_ASSERT_EQUAL_UINT32(without > LEAD_MS ? without : LEAD_MS, with);
+    // Pre-roll buffered: 20 blocks, ~311 ms of audio, the last one arriving
+    // ~296 ms after the first.
+    TEST_ASSERT_TRUE(with <= firstFrameMs + 300);
+    if (firstFrameMs >= 5) {
+      TEST_ASSERT_EQUAL_UINT32(without, with);  // Unchanged by the lead.
+    }
+  }
+  // A short (USB) pre-roll waits for the lead instead: max(lead, pre-roll).
+  TEST_ASSERT_EQUAL_UINT32(LEAD_MS, firstPlayLiveMs(40, LEAD_MS, 20));
+  TEST_ASSERT_EQUAL_UINT32(51, firstPlayLiveMs(40, 0, 20));  // 3 blocks, 47 ms.
+}
+
+void test_carrier_lead_does_not_apply_after_an_underrun() {
+  BigBuffer b = makeLeadBuffer(300, LEAD_MS);
+  auto f = bigFrame(1);
+  BigBuffer::Entry meta;
+  for (int i = 0; i < 5; i++) b.push(f.data(), f.size(), &SESSION_A, BIG_ACK, 10);
+  TEST_ASSERT_TRUE(b.shouldPlay(LEAD_MS, false, false));
+  while (!b.empty()) b.discard(meta);
+  b.noteEmptySlot();
+  TEST_ASSERT_EQUAL_UINT32(1, b.stats().underruns);
+  // Refilled by a burst: plays at once, with no new lead.
+  for (int i = 0; i < 5; i++) b.push(f.data(), f.size(), &SESSION_A, BIG_ACK, 400);
+  TEST_ASSERT_TRUE(b.shouldPlay(400, false, false));
+  TEST_ASSERT_EQUAL_UINT32(LEAD_MS, b.stats().prerollReachedMs);
+}
+
+void test_reset_sets_carrier_lead() {
+  BigBuffer b = makeLeadBuffer(300, LEAD_MS);
+  TEST_ASSERT_EQUAL_UINT32(LEAD_MS, b.leadMs());
+  b.reset(1000, 300);
+  TEST_ASSERT_EQUAL_UINT32(0, b.leadMs());
+  auto f = bigFrame(1);
+  for (int i = 0; i < 5; i++) b.push(f.data(), f.size(), &SESSION_A, BIG_ACK, 1001);
+  TEST_ASSERT_TRUE(b.shouldPlay(1001, false, false));
+}
+
 static TxReconcileInput keyedDraining() {
   // Keyed, PTT just released, voice still buffered.
   return {.keyed = true, .pttRequested = false, .txAllowed = true,
@@ -528,6 +639,10 @@ int main(int, char **) {
   RUN_TEST(test_credit_is_returned_exactly_once);
   RUN_TEST(test_unknown_window_holds_credit_until_played);
   RUN_TEST(test_repress_during_drain_continues_the_same_over);
+  RUN_TEST(test_burst_fill_waits_for_carrier_lead);
+  RUN_TEST(test_live_fill_is_not_delayed_by_carrier_lead);
+  RUN_TEST(test_carrier_lead_does_not_apply_after_an_underrun);
+  RUN_TEST(test_reset_sets_carrier_lead);
   RUN_TEST(test_policy_ptt_release_starts_drain);
   RUN_TEST(test_policy_filter_change_during_drain_is_deferred);
   RUN_TEST(test_policy_filter_change_with_nothing_to_drain_unkeys_first);

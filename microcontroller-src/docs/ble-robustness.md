@@ -168,6 +168,16 @@ frame count.
   2048 B window no longer limits the pre-roll, since credit comes back on
   receipt; see Flow control). Until playout starts the DAC gets explicit
   silence.
+* **Carrier lead.** Whatever triggers it, the first playout of an over is
+  never earlier than `TX_CARRIER_LEAD_MS` (300 ms) after the SA818 was keyed,
+  on every transport (see "When to key the SA818" below). A faster than
+  real-time host (record-then-send) reaches the 300 ms pre-roll level within
+  about 40 ms of keying; the buffer then keeps filling, bounded by free space
+  and credit as usual, and playout starts at the lead time. A live host fills
+  the pre-roll in real time from keying, so the lead has passed by the time
+  the pre-roll is reached and nothing changes for it. The lead applies only
+  to the first start of an over; re-pre-rolls after an underrun do not wait
+  for it.
 * **Underrun.** If the buffer runs dry mid-transmission, the firmware writes
   silence (never the stale DMA contents) and goes back to pre-rolling, instead
   of playing each late frame the moment it trickles in. After a stall the
@@ -269,7 +279,10 @@ after PTT release until that audio has played. A host should then:
   the release are applied once it drops;
 * expect a PTT re-press within that window to continue the same over;
 * not count the pre-roll as latency to compensate for: mouth-to-air is about
-  300 ms more than without the bit.
+  300 ms more than without the bit;
+* not hold audio back after keying to protect the first syllable (the radio
+  keeps at least 300 ms of carrier before the first audio), and not worry
+  about sending a recording faster than real time right after keying.
 
 Without the bit, the radio plays frames as they arrive and returns credit at
 once, as upstream firmware does.
@@ -277,15 +290,25 @@ once, as upstream firmware does.
 **When to key the SA818.** The transmitter is keyed at PTT-down, as before,
 and the pre-roll goes out as silence on the carrier. Receivers need time to
 open: carrier squelch, and especially CTCSS decoders, typically need 100 to
-250 ms of carrier before they unmute. Keying first means that time overlaps
-the pre-roll instead of adding to it, so the first syllable is not clipped. It
+250 ms of carrier before they unmute, and the SA818 itself ramps up after
+PTT. Keying first means that time overlaps the pre-roll instead of adding to
+it. The pre-roll alone does not guarantee it, though: a host that sends a
+recording as fast as credit allows fills it within tens of ms of keying, and
+the first version then played speech almost as soon as the carrier came up,
+which chopped the first word of every record-then-send over in an RF test
+with a handheld receiver. So the first audio is also held until
+`TX_CARRIER_LEAD_MS` (300 ms) after keying, independent of how fast the
+buffer fills. Written audio reaches the DAC about 40 to 55 ms after that
+(DMA), so speech starts about 340 to 360 ms into the carrier. It
 also keeps PTT semantics unchanged for hosts: `DEVICE_STATE_TX_ACTIVE` still
 follows PTT-down immediately, and host-side checks that wait for it (pgpilot's
 key watch, for example) are unaffected. The cost is up to 300 ms of carrier
 before speech, which is normal for a voice over.
 
-**Latency.** Mouth-to-air goes up by the pre-roll (about 300 ms over
-Bluetooth, 40 ms over USB) plus about 50 ms of DMA. On a link that stalls and
+**Latency.** Mouth-to-air goes up by max(carrier lead, pre-roll) from
+keying (300 ms on every transport, since the lead is 300 ms; USB, whose
+pre-roll is 40 ms, now waits for the lead too) plus about 50 ms of DMA. For a
+live over the lead adds nothing over the 300 ms BLE pre-roll. On a link that stalls and
 then bursts, the radio-side backlog can now grow to the buffer size (about
 1 s) instead of one window (about 470 ms); the total delay is the same either
 way, since the rest of the backlog used to wait on the host instead.
@@ -306,22 +329,22 @@ every connected session including USB, in release builds as well (values
 illustrative, a 10 s pgpilot over with 512 B frames):
 
 ```
-TX summary: keyed=10652 ms frames_in=161 bytes_in=82432 played=161 (~10022 ms) preroll=300 ms reached=yes@312 ms underruns=0 gap_silence=0 ms lead_silence=312 ms max_frame_gap=81 ms max_ble_write_gap=45 ms peak=2560 B (311 ms) overflows=0 late=0 i2s_blocked=0 ms discarded=0 drain=331 ms ble=yes interval=15.00 ms latency=0 mtu=247 dle=251/251 heap=53042 min=40698 credit_held=0 B
+TX summary: keyed=10652 ms frames_in=161 bytes_in=82432 played=161 (~10022 ms) preroll=300 ms reached=yes@312 ms underruns=0 gap_silence=0 ms lead_silence=312 ms max_frame_gap=81 ms max_ble_write_gap=45 ms peak=2560 B (311 ms) overflows=0 late=0 i2s_blocked=0 ms discarded=0 drain=331 ms ble=yes interval=15.00 ms latency=0 mtu=247 dle=251/251 heap=53042 min=40698 credit_held=0 B carrier_lead=300 ms
 ```
 
 The fields and their order are those of the first version, with
-`credit_held` appended at the end, so parsers that split on spaces and `=`
-keep working.
+`credit_held` and `carrier_lead` appended at the end, so parsers that split
+on spaces and `=` keep working.
 
 | Field | Meaning |
 | --- | --- |
 | `keyed` | Time in TX mode (includes pre-roll and drain) |
 | `frames_in`, `bytes_in` | TX audio frames and payload bytes received |
 | `played` | Frames played out in full, with the decoded audio time actually written to the DAC (real duration, whatever the frame size) |
-| `preroll`, `reached` | Pre-roll target, and when playout first started after keying |
+| `preroll`, `reached` | Pre-roll target, and when playout first started after keying (never before `carrier_lead`) |
 | `underruns` | Times the buffer ran dry while playing |
 | `gap_silence` | Silence inserted mid-transmission (underruns and re-pre-roll): **the audible dropouts** |
-| `lead_silence` | Silence before the first audio (the pre-roll) |
+| `lead_silence` | Silence before the first audio (the pre-roll and carrier lead) |
 | `max_frame_gap` | Longest gap between two TX audio frames reaching the buffer |
 | `max_ble_write_gap` | Longest gap between two GATT writes from the phone (BLE starvation) |
 | `peak` | Highest buffer fill, in bytes and audio time |
@@ -333,6 +356,7 @@ keep working.
 | `ble`, `interval`, `latency`, `mtu`, `dle` | Link state at the end of the transmission |
 | `heap`, `min` | Free heap now and the lowest it has been since boot |
 | `credit_held` | Most flow-control credit held back at once; 0 when the host sent in real time, up to one window after a burst |
+| `carrier_lead` | Minimum time from keying to the first audio (`TX_CARRIER_LEAD_MS`) |
 
 A clean over has `underruns=0 gap_silence=0 overflows=0 late=0 i2s_blocked=0 ms discarded=0`,
 and `played` close to `keyed` minus `lead_silence` and the ~50 ms DMA tail.
@@ -408,7 +432,8 @@ a normal build.
    `gap_silence` with the gaps the old firmware produced (old firmware: every
    gap longer than about 64 ms was audible).
 6. **Record-then-send fallback.** Five overs in the app's fallback mode. Expect
-   `reached` at or under 300 ms, `peak` up to the buffer size (up to about
+   `reached` at 300 ms (the carrier lead, although the pre-roll level is
+   buffered much earlier), `lead_silence` about 300 ms, `peak` up to the buffer size (up to about
    8 KB, 1 s), `credit_held` up to about one window (4 KB), `overflows=0`,
    `underruns=0`, `i2s_blocked=0 ms`, and `keyed` about equal to the recording
    length plus pre-roll and drain (`drain` up to about 1 s).
@@ -429,6 +454,7 @@ underruns and less gap silence than the per-gap dropouts of the old firmware
 for the same `max_ble_write_gap`.
 
 Later, with RF (low power into a dummy load, ideally with a second receiver):
-confirm that the first syllable is not clipped on a CTCSS-coded receiver, that
+confirm that the first syllable is not clipped on a CTCSS-coded receiver,
+for live and for record-then-send overs, that
 the end of an over is not cut, and repeat step 5 at high power into the dummy
 load to see whether `max_ble_write_gap` grows while keyed.

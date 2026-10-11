@@ -81,8 +81,11 @@ public:
       _bytes(new uint8_t[CAPACITY_BYTES]) {}
 
   // Start a new transmission. prerollMs is the target buffered audio before
-  // playout starts (and restarts after an underrun).
-  void reset(uint32_t nowMs, uint32_t prerollMs) {
+  // playout starts (and restarts after an underrun). leadMs is the minimum
+  // time from reset() (the moment the transmitter is keyed) to the first
+  // playout: receivers need carrier for a while before they unmute, however
+  // fast the host fills the buffer.
+  void reset(uint32_t nowMs, uint32_t prerollMs, uint32_t leadMs = 0) {
     _head = _tail = _count = 0;
     _byteHead = _byteTail = _byteCount = 0;
     _heldAckBytes = 0;
@@ -93,11 +96,13 @@ public:
     _hasLastPush = false;
     _startMs = nowMs;
     _prerollMs = prerollMs;
+    _leadMs = leadMs;
     _stats = Stats{};
   }
 
   void setPrerollMs(uint32_t prerollMs) { _prerollMs = prerollMs; }
   uint32_t prerollMs() const { return _prerollMs; }
+  uint32_t leadMs() const { return _leadMs; }
 
   size_t freeBytes() const { return CAPACITY_BYTES - _byteCount; }
   static constexpr size_t capacityBytes() { return CAPACITY_BYTES; }
@@ -150,7 +155,9 @@ public:
   }
 
   // Decide whether audio should be played now. Call once per playout slot.
-  // Playout (re)starts when any of these holds:
+  // Nothing is played before the carrier lead time since reset() has passed;
+  // until then the buffer keeps filling (bounded by free space and credit).
+  // After that, playout (re)starts when any of these holds:
   //  - the buffered audio reaches the pre-roll target,
   //  - the first frame of this pre-roll episode is pre-roll old (a host that
   //    cannot fill the target, e.g. a small window, is never stalled forever),
@@ -162,6 +169,9 @@ public:
       return false;
     }
     if (!_playing) {
+      if (!_stats.prerollReached && (uint32_t)(nowMs - _startMs) < _leadMs) {
+        return false;
+      }
       bool levelReached = bufferedMs() >= _prerollMs;
       bool aged = _episodeStarted && (uint32_t)(nowMs - _episodeStartMs) >= _prerollMs;
       if (levelReached || aged || creditPressure || drain) {
@@ -330,5 +340,6 @@ private:
   bool _hasLastPush = false;
   uint32_t _startMs = 0;
   uint32_t _prerollMs = 0;
+  uint32_t _leadMs = 0;
   Stats _stats{};
 };

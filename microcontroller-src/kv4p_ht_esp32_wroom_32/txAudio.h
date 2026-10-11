@@ -38,6 +38,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // pre-roll to absorb loop and scheduling jitter.
 static constexpr uint32_t TX_PREROLL_WIRELESS_MS = 300;
 static constexpr uint32_t TX_PREROLL_USB_MS = 40;
+// Minimum carrier before speech: no host audio is played until this long after
+// the SA818 is keyed, on every transport. Receivers need carrier for a while
+// before they unmute (carrier squelch, CTCSS decode, the SA818's own TX ramp:
+// roughly 150 to 300 ms), and a host that sends faster than real time (record
+// then send) fills the pre-roll within tens of ms of keying, which used to put
+// the first syllable on the air before the far end had opened. While waiting
+// the buffer keeps filling, bounded by free space and credit as always. A live
+// host fills the pre-roll in real time from keying, so it reaches this point
+// anyway and gets no extra delay over the BLE pre-roll.
+static constexpr uint32_t TX_CARRIER_LEAD_MS = 300;
 // The I2S driver's TX DMA is a ring of 6 x 512 samples (64 ms at 48 kHz) that
 // never stops: a buffer is refilled only when we write, otherwise the DAC
 // replays whatever it held last (auto_clear is off). A write only proceeds
@@ -84,8 +94,8 @@ static constexpr size_t TX_JITTER_CAPACITY_BYTES = 8192;
 static constexpr size_t TX_JITTER_CAPACITY_ENTRIES = TX_JITTER_CAPACITY_BYTES / AUDIO_FRAME_BYTES + 8;
 static constexpr uint32_t TX_JITTER_CAPACITY_MS =
     (uint32_t)((uint64_t)TX_JITTER_CAPACITY_BYTES * AUDIO_FRAME_SAMPLES_WIRE / AUDIO_FRAME_BYTES * 1000 / AUDIO_WIRE_SAMPLE_RATE);
-static_assert(TX_JITTER_CAPACITY_MS + TX_PLAYOUT_FLUSH_US / 1000 < TX_DRAIN_MAX_MS,
-              "a full buffer must be able to drain before the drain cap");
+static_assert(TX_CARRIER_LEAD_MS + TX_JITTER_CAPACITY_MS + TX_PLAYOUT_FLUSH_US / 1000 < TX_DRAIN_MAX_MS,
+              "a full buffer released right at keying must drain (after the carrier lead) before the drain cap");
 static_assert(TX_JITTER_CAPACITY_MS > TX_PREROLL_WIRELESS_MS, "the pre-roll must fit");
 
 // Counts PCM bytes on their way to I2S, so playout can be paced against the
@@ -372,7 +382,7 @@ static void txWriteSilenceFrame() {
 // Called when entering MODE_TX. hostVoice is false for AX.25 packets.
 void txPlayoutBegin(bool hostVoice) {
   uint32_t now = millis();
-  txJitter.reset(now, TX_PREROLL_WIRELESS_MS);
+  txJitter.reset(now, TX_PREROLL_WIRELESS_MS, TX_CARRIER_LEAD_MS);
   txPlayout = TxPlayoutStats{};
   txPlayout.active = true;
   txPlayout.hostVoice = hostVoice;
