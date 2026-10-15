@@ -506,8 +506,46 @@ void txKeyRetryLoop() {
   reconcileDesiredState(false);
 }
 
+// Swap I2S0 from the RX driver to the TX driver for a key-down. On failure
+// (the TX DMA ring did not fit in the heap) RX is restarted and false is
+// returned. Runs before `mode` changes, so a refused key is never visible as
+// MODE_TX to anything, a DeviceState included, and PTT is never pulled.
+static bool installTxDriverForKey() {
+  endI2SRx();
+#ifdef KV4P_TEST_STARVE_I2S
+  // Bench-only fault injection: hold the DMA heap in 1 KB pieces so the TX
+  // driver install fails the way it does when Bluetooth has the heap.
+  // KV4P_TEST_STARVE_I2S attempts out of every KV4P_TEST_STARVE_I2S + 1
+  // fail (a large value fails them all).
+  static void *starveHog[96];
+  static uint32_t starveAttempts = 0;
+  size_t starveHeld = 0;
+  if (starveAttempts++ % (KV4P_TEST_STARVE_I2S + 1) < KV4P_TEST_STARVE_I2S) {
+    while (starveHeld < 96 && heap_caps_get_largest_free_block(MALLOC_CAP_DMA) >= 1024) {
+      starveHog[starveHeld] = heap_caps_malloc(1024, MALLOC_CAP_DMA);
+      if (starveHog[starveHeld] == nullptr) break;
+      ++starveHeld;
+    }
+  }
+  bool txInstalled = initI2STx();
+  for (size_t i = 0; i < starveHeld; ++i) heap_caps_free(starveHog[i]);
+#else
+  bool txInstalled = initI2STx();
+#endif
+  if (!txInstalled) {
+    initI2SRx();
+  }
+  return txInstalled;
+}
+
 void setMode(Mode newMode) {
   if (mode == newMode) {
+    return;
+  }
+  txKeyLastAttemptRefused = false;
+  if (newMode == MODE_TX && !installTxDriverForKey()) {
+    txKeyLastAttemptRefused = true;
+    resetDiagnosticsUpdate(false, (desiredState.flags & HOST_STATE_HIGH_POWER) != 0, 0);
     return;
   }
   freeDvRx.reset();
@@ -530,39 +568,8 @@ void setMode(Mode newMode) {
     break;
     case MODE_TX:
       _LOGI("MODE_TX");
-      txKeyLastAttemptRefused = false;
-      // The TX driver goes in before the carrier, so a refused key never
-      // pulses PTT.
-      endI2SRx();
-#ifdef KV4P_TEST_STARVE_I2S
-      // Bench-only fault injection: hold the DMA heap in 1 KB pieces so the TX
-      // driver install fails the way it does when Bluetooth has the heap.
-      // KV4P_TEST_STARVE_I2S attempts out of every KV4P_TEST_STARVE_I2S + 1
-      // fail (a large value fails them all).
-      static void *starveHog[96];
-      static uint32_t starveAttempts = 0;
-      size_t starveHeld = 0;
-      if (starveAttempts++ % (KV4P_TEST_STARVE_I2S + 1) < KV4P_TEST_STARVE_I2S) {
-        while (starveHeld < 96 && heap_caps_get_largest_free_block(MALLOC_CAP_DMA) >= 1024) {
-          starveHog[starveHeld] = heap_caps_malloc(1024, MALLOC_CAP_DMA);
-          if (starveHog[starveHeld] == nullptr) break;
-          ++starveHeld;
-        }
-      }
-      bool txInstalled = initI2STx();
-      for (size_t i = 0; i < starveHeld; ++i) heap_caps_free(starveHog[i]);
-      if (!txInstalled) {
-#else
-      if (!initI2STx()) {
-#endif
-        // The TX DMA ring did not fit in the heap. PTT was never pulled:
-        // go back to receive and let the caller's policy retry.
-        mode = rxIdleMode();
-        initI2SRx();
-        txKeyLastAttemptRefused = true;
-        markDeviceStateDirty();
-        break;
-      }
+      // The TX driver is already in (installTxDriverForKey()); the carrier
+      // comes after it, so a refused key never pulses PTT.
       txStartTime = millis();
       txWatchDog.reset(txStartTime);
 #ifndef KV4P_BENCH_NO_RF
