@@ -21,6 +21,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <DRA818.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
+#include <functional>
 #include "globals.h"
 #include "firmwareVersion.h"
 #include "debug.h"
@@ -77,6 +78,14 @@ Ax25TxScheduler ax25TxScheduler;
 static constexpr uint16_t AX25_OVERRIDE_RX_SETTLE_MS = 260;
 bool ax25OverrideChannelPrepared = false;
 uint32_t ax25OverrideChannelReadyAt = 0;
+// RF module recovery: power-down pulse length and settle time, and the
+// background probe for a module that is missing.
+static constexpr uint32_t SA818_PD_LOW_MS = 200;
+static constexpr uint32_t SA818_PD_SETTLE_MS = 1000;
+static constexpr int SA818_BOOT_HANDSHAKES = 9;
+static constexpr uint32_t SA818_BOOT_ANSWER_MS = 2000;
+static constexpr uint32_t SA818_PROBE_INTERVAL_MS = 5000;
+static constexpr uint32_t SA818_PROBE_ANSWER_MS = 300;
 
 float moduleMinRadioFreq() {
   return hw.rfModuleType == RF_SA818_UHF ? 400.0f : 134.0f;
@@ -292,12 +301,49 @@ uint16_t appliedFilterFlags() {
   return appliedState.flags & (HOST_STATE_FILTER_PRE | HOST_STATE_FILTER_HIGH | HOST_STATE_FILTER_LOW);
 }
 
+// The SA818 answers a command within milliseconds, and the library waits up
+// to 2 s for that answer. These used to retry forever while feeding the task
+// watchdog, so a module that stopped answering (or was never found at boot)
+// froze the main loop for good: the radio stayed connected but silent until
+// someone reset it. Now a module that misses this many answers in a row is
+// marked lost, and radioModuleProbeLoop() looks for it again.
+static constexpr int SA818_COMMAND_ATTEMPTS = 3;
+
+void markRadioModuleLost() {
+  if (radioModuleStatus == RADIO_MODULE_FOUND) {
+    radioBootInfo.lostCount++;
+    radioBootInfo.present = false;
+    debug_log_printf(COMMAND_DEBUG_WARN, "SA818 stopped answering; probing for it again");
+  }
+  radioModuleStatus = RADIO_MODULE_NOT_FOUND;
+  radioConfigApplied = false;
+  filtersApplied = false;
+  markDeviceStateDirty();
+}
+
+bool sa818Command(const std::function<bool()> &command, uint8_t errorCode) {
+  if (radioModuleStatus != RADIO_MODULE_FOUND) {
+    lastDeviceStateError = errorCode;
+    return false;
+  }
+  for (int i = 0; i < SA818_COMMAND_ATTEMPTS; i++) {
+    esp_task_wdt_reset();
+    if (command()) {
+      return true;
+    }
+    lastDeviceStateError = errorCode;
+  }
+  markRadioModuleLost();
+  return false;
+}
+
 void applyFilterFlags() {
   uint16_t filterFlags = desiredFilterFlags();
-  drainRadioSerial();
-  while (!sa818.filters((filterFlags & HOST_STATE_FILTER_PRE), false, false)) {
-    lastDeviceStateError = DEVICE_STATE_ERROR_FILTERS_FAILED;
-    esp_task_wdt_reset();
+  if (!sa818Command([&] {
+        drainRadioSerial();
+        return sa818.filters((filterFlags & HOST_STATE_FILTER_PRE), false, false);
+      }, DEVICE_STATE_ERROR_FILTERS_FAILED)) {
+    return;  // filtersApplied stays false, so the change is applied once the module answers.
   }
   rxDownsample.setFilters((filterFlags & HOST_STATE_FILTER_HIGH) != 0,
                           (filterFlags & HOST_STATE_FILTER_LOW) != 0);
@@ -340,12 +386,11 @@ void reconcileDesiredState(bool sendReport = true) {
     applyFilterFlags();
   }
 
-  if ((desiredState.flags & HOST_STATE_RADIO_CONFIG_VALID) && radioConfigChanged()) {
-    drainRadioSerial();
-    while (!sa818.group(desiredState.bw, desiredState.freq_tx, desiredState.freq_rx, desiredState.ctcss_tx, 0, 0)) {
-      lastDeviceStateError = DEVICE_STATE_ERROR_RADIO_CONFIG_FAILED;
-      esp_task_wdt_reset();
-    }
+  if ((desiredState.flags & HOST_STATE_RADIO_CONFIG_VALID) && radioConfigChanged()
+      && sa818Command([&] {
+           drainRadioSerial();
+           return sa818.group(desiredState.bw, desiredState.freq_tx, desiredState.freq_rx, desiredState.ctcss_tx, 0, 0);
+         }, DEVICE_STATE_ERROR_RADIO_CONFIG_FAILED)) {
     appliedState.bw = desiredState.bw;
     appliedState.freq_tx = desiredState.freq_tx;
     appliedState.freq_rx = desiredState.freq_rx;
@@ -479,9 +524,27 @@ void logTxSummary() {
                    (unsigned long)js.peakHeldAckBytes, (unsigned long)txJitter.leadMs());
 }
 
+// Put the RF module's control lines in a known state before anything else.
+// While the ESP32 is in reset and until setup() configures them, these pins
+// float. The module's PTT is active low, so a floating PTT can leave it keyed
+// (drawing up to about an amp) through the Bluetooth start-up, which is the
+// heaviest load the ESP32 itself puts on the supply. That turns one reset
+// into several. Releasing power-down early also gives the module more time to
+// start before the handshake.
+uint32_t sa818PowerUpMs = 0;
+
+void earlyRadioPinsSetup() {
+  pinMode(hw.pins.pinPtt, OUTPUT);
+  digitalWrite(hw.pins.pinPtt, HIGH);  // Rx
+  pinMode(hw.pins.pinPd, OUTPUT);
+  digitalWrite(hw.pins.pinPd, HIGH);   // Power on
+  sa818PowerUpMs = millis();
+}
+
 void setup() {
   resetDiagnosticsBegin();
   boardSetup();
+  earlyRadioPinsSetup();
   loadPersistedRadioState();
   // Communication with Android via USB cable
   Serial.setRxBufferSize(USB_BUFFER_SIZE);
@@ -522,11 +585,7 @@ void setup() {
   esp_task_wdt_init(10, true);  // Reboot if locked up for a bit
   esp_task_wdt_add(NULL);       // Add the current task to WDT watch
   buttonsSetup();
-  // Set up radio module defaults
-  pinMode(hw.pins.pinPd, OUTPUT);
-  digitalWrite(hw.pins.pinPd, HIGH);  // Power on
-  pinMode(hw.pins.pinPtt, OUTPUT);
-  digitalWrite(hw.pins.pinPtt, HIGH);  // Rx
+  // Set up radio module defaults (PTT and power-down: earlyRadioPinsSetup())
   pinMode(hw.pins.pinSq, INPUT);
   if (hw.features.hasHL) {
     pinMode(hw.pins.pinHl, OUTPUT);
@@ -546,6 +605,7 @@ void setup() {
   if (radioModuleStatus == RADIO_MODULE_FOUND) {
     reconcileDesiredState(false);
   }
+  setupDoneMs = millis();
   sendHello(protocolUsbSession, FIRMWARE_VER, radioModuleStatus, hw.rfModuleType, moduleMinRadioFreq(), moduleMaxRadioFreq(), getFirmwareFeatures(), currentDeviceState(protocolUsbSession.flags));
   sendResetDiagnostics(Serial);
   _LOGI("Setup is finished");
@@ -561,17 +621,113 @@ void initRadio(bool isHigh) {
     digitalWrite(hw.pins.pinHl, isHigh ? LOW : HIGH);
   }
   radioModuleStatus = RADIO_MODULE_NOT_FOUND;
-  // The sa818.handshake() has 3 retries internally with 2 seconds between each attempt.
-  // We have 3 retries on top of that, so total wait time is up to 20 seconds.
-  // This should allow the radio module to power up and respond.
-  for (int i = 0; i < 3; i++) {
+  // Up to 9 handshakes of up to 2 s each, as before (the library's handshake
+  // tried 3 times, 3 rounds of it). A module still silent after 3 gets its
+  // power-down pin pulsed before the next 3: modules have come up silent after
+  // a reset and stayed so until the next reset.
+  for (int i = 0; i < SA818_BOOT_HANDSHAKES; i++) {
     esp_task_wdt_reset();
-    if (sa818.handshake()) { //Check if radio responded to handshake attempt
-      radioModuleStatus = RADIO_MODULE_FOUND;
-      sa818.volume(hw.volume);
-      sa818.filters(false, false, false);
-      break;
+    if (i > 0 && i % 3 == 0) {
+      pulseRadioPowerDown();
     }
+    if (sa818Handshake(SA818_BOOT_ANSWER_MS)) {
+      radioModuleFound();
+      return;
+    }
+  }
+  debug_log_printf(COMMAND_DEBUG_WARN, "SA818 did not answer at boot; probing for it in the background");
+}
+
+// One AT+DMOCONNECT. The module answers "+DMOCONNECT:0"; anything else, or
+// nothing within timeoutMs, is a miss. Same test as the DRA818 library's
+// handshake (the last character before the line end is '0').
+bool sa818Handshake(uint32_t timeoutMs) {
+  drainRadioSerial();
+  Serial2.print("AT+DMOCONNECT\r\n");
+  radioBootInfo.handshakes++;
+  char line[32];
+  size_t len = 0;
+  uint32_t start = millis();
+  while ((uint32_t)(millis() - start) < timeoutMs) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      if (c == '\r') {
+        continue;
+      }
+      if (c == '\n') {
+        line[len] = '\0';
+        if (len > 0 && line[len - 1] == '0' && strstr(line, "DMOCONNECT") != nullptr) {
+          return true;
+        }
+        len = 0;
+      } else if (len < sizeof(line) - 1) {
+        line[len++] = c;
+      }
+    }
+    delay(1);
+  }
+  return false;
+}
+
+// Power-down low, then high again, then give the module time to start. Feeds
+// the task watchdog (10 s) while it waits.
+void pulseRadioPowerDown() {
+  radioBootInfo.pdPulses++;
+  digitalWrite(hw.pins.pinPd, LOW);
+  delay(SA818_PD_LOW_MS);
+  digitalWrite(hw.pins.pinPd, HIGH);
+  sa818PowerUpMs = millis();
+  esp_task_wdt_reset();
+  delay(SA818_PD_SETTLE_MS);
+  esp_task_wdt_reset();
+}
+
+void radioModuleFound() {
+  radioModuleStatus = RADIO_MODULE_FOUND;
+  radioBootInfo.found = true;
+  radioBootInfo.present = true;
+  if (radioBootInfo.readyMs == 0) {
+    radioBootInfo.readyMs = max<uint32_t>(1, millis() - sa818PowerUpMs);
+  }
+  sa818.volume(hw.volume);
+  sa818.filters(false, false, false);
+}
+
+// A module that was not found at boot, or that stopped answering, is looked
+// for again here without blocking the loop for long: one handshake with a
+// short timeout every few seconds, every third one after a power-down pulse.
+// Once it answers, the host's configuration is applied as if it had just
+// arrived, and DeviceState (radioModuleStatus) tells hosts it is back.
+void radioModuleProbeLoop() {
+  static uint32_t lastProbeMs = 0;
+  static uint32_t probes = 0;
+  if (radioModuleStatus == RADIO_MODULE_FOUND || mode == MODE_TX) {
+    return;
+  }
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastProbeMs) < SA818_PROBE_INTERVAL_MS) {
+    return;
+  }
+  probes++;
+  if (probes % 3 == 0) {
+    pulseRadioPowerDown();
+  }
+  bool found = sa818Handshake(SA818_PROBE_ANSWER_MS);
+  lastProbeMs = millis();
+  if (!found) {
+    return;
+  }
+  bool firstTime = !radioBootInfo.found;
+  radioModuleFound();
+  if (firstTime) {
+    radioBootInfo.lateFoundMs = max<uint32_t>(1, millis());
+  }
+  filtersApplied = false;
+  radioConfigApplied = false;
+  reconcileDesiredState();
+  char line[160];
+  if (formatBootLine(line, sizeof(line)) > 0) {
+    debug_log_printf(COMMAND_DEBUG_INFO, "%s", line);
   }
 }
 
@@ -651,12 +807,13 @@ void handleKissParameter(uint8_t command, uint8_t value) {
 }
 
 void prepareAx25TxOverrideChannel(const Ax25TxOverride &txOverride) {
-  drainRadioSerial();
   // Tune RX to the packet's target before carrier sense. The normal radio
   // configuration is deliberately marked stale so it is restored after TX.
-  while (!sa818.group(txOverride.bw, txOverride.freqTx, txOverride.freqTx, txOverride.ctcssTx, 0, 0)) {
-    lastDeviceStateError = DEVICE_STATE_ERROR_RADIO_CONFIG_FAILED;
-    esp_task_wdt_reset();
+  if (!sa818Command([&] {
+        drainRadioSerial();
+        return sa818.group(txOverride.bw, txOverride.freqTx, txOverride.freqTx, txOverride.ctcssTx, 0, 0);
+      }, DEVICE_STATE_ERROR_RADIO_CONFIG_FAILED)) {
+    return;  // The job waits in the queue until the module is back.
   }
   radioConfigApplied = false;
   ax25OverrideChannelPrepared = true;
@@ -680,6 +837,7 @@ bool ax25OverrideMatchesActiveChannel(const Ax25TxOverride &txOverride) {
 void ax25TxLoop() {
   const Ax25TxJob *pendingJob = ax25TxScheduler.head();
   if (pendingJob == nullptr) return;
+  if (radioModuleStatus != RADIO_MODULE_FOUND) return;
   bool receiveIdle = mode == MODE_RX || mode == MODE_STOPPED;
   if (!receiveIdle || !txAllowedByHost()) return;
   uint32_t now = millis();
@@ -747,7 +905,7 @@ void rssiLoop() {
           latestRssi = rssi;
           markDeviceStateDirty();
         }
-      } else if (mode == MODE_RX && !freeDv2400bEnabled()) {
+      } else if (mode == MODE_RX && !freeDv2400bEnabled() && radioModuleStatus == RADIO_MODULE_FOUND) {
         // TODO fix the dra818 library's implementation of rssi(). Right now it just drops the
         // return value from the module, and just tells us success/fail.
         // int rssi = dra->rssi();
@@ -879,5 +1037,6 @@ void loop() {
   ax25TxLoop();
   txAudioLoop();
   rssiLoop();
+  radioModuleProbeLoop();
   deviceStateLoop();
 }

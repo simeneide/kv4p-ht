@@ -35,8 +35,25 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // COMMAND_DEBUG_INFO text frames to each host session after HELLO. Debug frames
 // already exist in the protocol, so hosts that do not care simply log or drop
 // them; nothing in HELLO or DeviceState changes.
+//
+// Two further lines make a power-on reset less of a dead end. On the ESP32 a
+// power-on reset (rst:0x1) is what a real supply collapse reports, but also
+// what the EN pin reports (the reset button, or the USB bridge's DTR/RTS
+// auto-reset circuit), and it wipes RTC memory, so the breadcrumb above cannot
+// help. So:
+//  - "Reset reason boot:" carries a boot counter kept in NVS, which survives a
+//    power cycle and so counts restarts no host saw, and how the SA818 came up:
+//    how many handshakes it took and how long after its power-down pin was
+//    released. An SA818 that answers at once was not power cycled with the
+//    ESP32; one that needs seconds probably was, or was wedged.
+//  - "Reset reason crash:" is a compact form of the core dump summary, only on
+//    a boot whose reset reason says the dump is fresh (panic or watchdog).
+// Both lines contain "Reset reason" on purpose: hosts that already keep the
+// first line (pgpilot keeps any debug line naming the reset reason, cut to 120
+// characters) keep these too, with the most useful fields first.
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <esp_system.h>
 #include <esp_attr.h>
 #include <esp_core_dump.h>
@@ -66,6 +83,25 @@ esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
 // Formatted once at boot: reading and checking the dump scans up to 64 KB of
 // flash, which must not happen on every host connect.
 char *coreDumpLine = nullptr;
+// Compact core dump summary, only when this boot's reset reason says the dump
+// in flash was written by the crash that caused it.
+char *crashLine = nullptr;
+// Boots since the counter was first written, kept in NVS so that a power-on
+// reset does not clear it. 0 if NVS could not be read.
+uint32_t nvsBootCount = 0;
+
+// How the RF module came up this boot. Filled in by the sketch.
+struct RadioBootInfo {
+  uint32_t handshakes;     // AT+DMOCONNECT sent, at boot and by the background probe.
+  uint32_t pdPulses;       // Power-down pin pulses used to wake a silent module.
+  uint32_t readyMs;        // From releasing power-down to the first answer; 0 if never.
+  uint32_t lateFoundMs;    // Uptime when a module missing at boot was found later; 0 if not.
+  uint32_t lostCount;      // Times the module stopped answering after it had been found.
+  bool found;              // Answered at least once this boot.
+  bool present;            // Answering now (false once lost, until found again).
+};
+RadioBootInfo radioBootInfo = {};
+uint32_t setupDoneMs = 0;
 
 uint32_t resetBreadcrumbCheck(const ResetBreadcrumb &b) {
   return (b.magic ^ b.bootCount ^ (b.uptimeMs * 31) ^ ((uint32_t)b.keyed << 8) ^ ((uint32_t)b.highPower << 16)
@@ -124,11 +160,22 @@ void resetDiagnosticsBegin() {
   resetBreadcrumb.bootCount = bootCount;
   resetBreadcrumb.check = resetBreadcrumbCheck(resetBreadcrumb);
 
+  Preferences diagPrefs;
+  if (diagPrefs.begin("diag", false)) {
+    nvsBootCount = diagPrefs.getULong("boots", 0) + 1;
+    diagPrefs.putULong("boots", nvsBootCount);
+    diagPrefs.end();
+  }
+
   char line[400];
   int n = formatCoreDumpLine(line, sizeof(line));
   if (n > 0) {
     coreDumpLine = strdup(line);
   }
+}
+
+bool resetReasonWritesCoreDump(esp_reset_reason_t reason) {
+  return reason == ESP_RST_PANIC || reason == ESP_RST_TASK_WDT || reason == ESP_RST_INT_WDT;
 }
 
 // Call from loop() and on every key/unkey; cheap, writes RTC memory at most
@@ -166,6 +213,16 @@ int formatResetReasonLine(char *out, size_t outSize) {
   return n;
 }
 
+// "Reset reason boot: ..." (see the top of this file). Most telling first.
+int formatBootLine(char *out, size_t outSize) {
+  const RadioBootInfo &r = radioBootInfo;
+  const char *sa818 = !r.found ? "missing" : !r.present ? "lost" : r.lateFoundMs ? "late" : "ok";
+  return snprintf(out, outSize,
+                  "Reset reason boot: boots=%lu sa818=%s hs=%lu pd=%lu ready=%lums late=%lums lost=%lu setup=%lums",
+                  (unsigned long)nvsBootCount, sa818, (unsigned long)r.handshakes, (unsigned long)r.pdPulses, (unsigned long)r.readyMs,
+                  (unsigned long)r.lateFoundMs, (unsigned long)r.lostCount, (unsigned long)setupDoneMs);
+}
+
 // Formats a one-line summary of the core dump stored in flash, or returns 0 if
 // there is none. A dump stays in flash until the next crash overwrites it, so
 // it may be older than this boot; the reset reason tells whether it is fresh.
@@ -198,6 +255,20 @@ int formatCoreDumpLine(char *out, size_t outSize) {
     if (n > 0 && (size_t)n < outSize && summary->exc_bt_info.corrupted) {
       n += snprintf(out + n, outSize - n, " (corrupted)");
     }
+    if (resetReasonWritesCoreDump(bootResetReason)) {
+      // Fields in order of use, no 0x prefixes: a host that keeps 120
+      // characters still gets the task, PC, cause and the first frames.
+      char compact[200];
+      int c = snprintf(compact, sizeof(compact), "Reset reason crash: task=%.16s pc=%08lx cause=%lu va=%08lx bt=",
+                       summary->exc_task, (unsigned long)summary->exc_pc,
+                       (unsigned long)summary->ex_info.exc_cause, (unsigned long)summary->ex_info.exc_vaddr);
+      for (uint32_t i = 0; i < summary->exc_bt_info.depth && i < 8 && c > 0 && (size_t)c < sizeof(compact); i++) {
+        c += snprintf(compact + c, sizeof(compact) - c, "%s%08lx", i == 0 ? "" : ",", (unsigned long)summary->exc_bt_info.bt[i]);
+      }
+      if (c > 0) {
+        crashLine = strdup(compact);
+      }
+    }
   } else {
     n = snprintf(out, outSize, "Core dump: %u bytes at 0x%x (summary unavailable)", (unsigned)size, (unsigned)addr);
   }
@@ -217,6 +288,9 @@ void printResetDiagnostics(Print &out) {
   if (formatResetReasonLine(line, sizeof(line)) > 0) {
     out.println(line);
   }
+  if (crashLine != nullptr) {
+    out.println(crashLine);
+  }
   if (coreDumpLine != nullptr) {
     out.println(coreDumpLine);
   }
@@ -231,6 +305,12 @@ void sendResetDiagnostics(Stream &out) {
   char line[200];
   if (formatResetReasonLine(line, sizeof(line)) > 0) {
     sendKv4pVendorFrame(out, COMMAND_DEBUG_INFO, (const uint8_t *)line, strnlen(line, sizeof(line)));
+  }
+  if (formatBootLine(line, sizeof(line)) > 0) {
+    sendKv4pVendorFrame(out, COMMAND_DEBUG_INFO, (const uint8_t *)line, strnlen(line, sizeof(line)));
+  }
+  if (crashLine != nullptr) {
+    sendKv4pVendorFrame(out, COMMAND_DEBUG_INFO, (const uint8_t *)crashLine, strlen(crashLine));
   }
   if (coreDumpLine != nullptr) {
     sendKv4pVendorFrame(out, COMMAND_DEBUG_INFO, (const uint8_t *)coreDumpLine, strlen(coreDumpLine));

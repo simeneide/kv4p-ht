@@ -13,7 +13,12 @@ changes are aimed at upstream and are described in detail in
 [microcontroller-src/docs/ble-robustness.md](microcontroller-src/docs/ble-robustness.md):
 
 * Reports why the radio restarted (reset reason, a breadcrumb saying whether it
-  was transmitting, and a core dump summary) at boot and on every connect.
+  was transmitting, and a core dump summary) at boot and on every connect,
+  plus a power-cycle-proof boot counter and how the SA818 came up.
+* Never freezes the main loop on an SA818 that does not answer: it is marked
+  missing, probed again in the background (with power-down pulses) and
+  configured once it answers. PTT and power-down are driven before Bluetooth
+  starts.
 * Requests LE data length 251 and iOS-friendly BLE connection parameters.
 * Buffers TX audio from the host and plays it out at the DAC's pace, so a
   congested Bluetooth link (for example with a headset microphone open) gives

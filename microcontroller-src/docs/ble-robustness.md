@@ -98,6 +98,52 @@ as the same commit, toolchain and platform version were used.
 Opening the serial port normally toggles DTR/RTS, which resets most ESP32
 boards (an EN reset reports as POWERON and clears the RTC breadcrumb). Use
 `tools/kv4p_log.py` or `pio device monitor --dtr 0 --rts 0` to avoid that.
+Whether that is enough depends on the host driver: if it raises both DTR and
+RTS on open, clearing them one at a time passes through DTR off/RTS on, which
+is exactly the state the auto-reset transistors turn into EN low. Check for a
+boot banner right after opening before trusting a capture.
+
+### When the reason is POWERON
+
+On the ESP32 `ESP_RST_POWERON` (ROM `rst:0x1`) covers a real supply collapse
+and any pull of the EN pin: the reset button, the CP2102N's DTR/RTS
+auto-reset circuit, or noise on EN (on v2.0 boards EN has a 10 k pull-up and
+only an RF bypass cap, no 1 uF delay cap). A sag the brownout detector catches
+(level 0, about 2.43 V, enabled in the Arduino 2.0.17 sdkconfig) reports
+`BROWNOUT` instead, and every watchdog reports its own reason, so neither is
+hidden behind POWERON. POWERON wipes RTC memory, so two more lines go out on
+every connect, after the reset reason line:
+
+```
+Reset reason boot: boots=412 sa818=ok hs=1 pd=0 ready=742ms late=0ms lost=0 setup=1203ms
+Reset reason crash: task=BTC_TASK pc=400d6a1c cause=29 va=00000002 bt=400d6a1c,400d6b80,...
+```
+
+* `boots` counts boots in NVS, so it survives a power cycle and shows restarts
+  no host saw (compare it between connects).
+* `sa818` is `ok`, `late` (found by the background probe, `late` is the uptime
+  then), `lost` (stopped answering, `lost` counts how often) or `missing`. `hs`
+  is how many AT+DMOCONNECT were sent, `pd` how many power-down pulses were
+  needed, `ready` the time from releasing power-down to the first answer. A
+  module that needs seconds was probably reset along with the ESP32 or wedged;
+  one that answers at once was not power cycled.
+* The crash line is a compact core dump summary, only on a boot whose reason
+  says the dump is fresh (PANIC, TASK_WDT, INT_WDT). It names the task, PC,
+  exception cause and address, and the first backtrace frames, in that order,
+  for hosts that keep only the first 120 characters.
+
+### The RF module never hangs the main loop
+
+SA818 commands used to retry forever while feeding the task watchdog. A module
+that did not answer at boot (`radioFound=false`), or stopped answering, then
+froze the main loop as soon as a host sent its configuration: the radio stayed
+connected but silent until it was reset. Now each command tries three times,
+then marks the module lost; the loop keeps running, DeviceState reports the
+module as missing, and a probe sends one handshake every 5 s (a power-down
+pulse every third time) until it answers, then applies the host's
+configuration. At boot the handshake also pulses power-down after every third
+silent attempt. PTT and power-down are driven before Bluetooth starts, so a
+module is never left keyed by a floating pin while the ESP32 boots.
 
 ## 2. LE Data Length Extension
 
