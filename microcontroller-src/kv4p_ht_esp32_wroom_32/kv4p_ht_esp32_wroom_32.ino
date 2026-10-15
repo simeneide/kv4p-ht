@@ -507,7 +507,7 @@ void logTxSummary() {
                    "reached=%s@%lu ms underruns=%lu gap_silence=%lu ms lead_silence=%lu ms max_frame_gap=%lu ms "
                    "max_ble_write_gap=%lu ms peak=%lu B (%lu ms) overflows=%lu late=%lu i2s_blocked=%lu ms discarded=%lu drain=%lu ms "
                    "ble=%s interval=%u.%02u ms latency=%u mtu=%u dle=%u/%u heap=%u min=%u credit_held=%lu B "
-                   "carrier_lead=%lu ms",
+                   "carrier_lead=%lu ms adpcm_bad=%lu adpcm_stray=%lu adpcm_rejected=%lu ble_rx_overflow=%lu",
                    (unsigned long)keyedMs, (unsigned long)js.framesIn, (unsigned long)js.bytesIn,
                    (unsigned long)js.framesOut, (unsigned long)audioMs, (unsigned long)txJitter.prerollMs(),
                    js.prerollReached ? "yes" : "no", (unsigned long)js.prerollReachedMs, (unsigned long)js.underruns,
@@ -521,7 +521,10 @@ void logTxSummary() {
                    protocolHasBleSession() ? "yes" : "no", (link.connInterval * 125) / 100,
                    (link.connInterval * 125) % 100, link.connLatency, link.mtu, link.txOctets, link.rxOctets,
                    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
-                   (unsigned long)js.peakHeldAckBytes, (unsigned long)txJitter.leadMs());
+                   (unsigned long)js.peakHeldAckBytes, (unsigned long)txJitter.leadMs(),
+                   (unsigned long)(txAdpcmDecoder.badBlocks - txPlayout.badBlocksAtStart),
+                   (unsigned long)txPlayout.strayBytes, (unsigned long)txPlayout.framesRejected,
+                   (unsigned long)bleKissStream.stats().rxIncomingOverflowDrops);
 }
 
 // Put the RF module's control lines in a known state before anything else.

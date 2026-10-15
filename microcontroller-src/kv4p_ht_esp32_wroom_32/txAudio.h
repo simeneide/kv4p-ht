@@ -135,7 +135,56 @@ AudioInfo txAudioInfo(AUDIO_WIRE_SAMPLE_RATE, 1, 16);
 CountingPrint txOutCounter(out);
 AudioUpsampleOutput txUpsample(txOutCounter);
 VolumeMeter txVolumeMeter(txUpsample);
-ADPCMDecoder txAdpcmDecoder(AV_CODEC_ID_ADPCM_IMA_WAV, AUDIO_FRAME_BYTES);
+// The library decoder collects bytes into a 128-byte block and decodes each
+// full block. Its position in the block (current_byte) is never reset: end()
+// is not safe to re-begin on the pinned library, so the decoder lives across
+// every transmission and every host session. One payload that is not a whole
+// number of blocks therefore shifts every later block, for good: a shifted IMA
+// WAV block header reads a reserved byte into a 16-bit step index > 88, the
+// library rejects the block (AVERROR_INVALIDDATA) and outputs no samples, and
+// playout fills the gap with silence. The result is a carrier with no audio on
+// every over until the ESP32 restarts, surviving reconnects.
+//
+// This subclass exposes the block position so it can be put back to the start
+// at every key-down and before every chunk (chunks start on block
+// boundaries), and counts blocks the library rejected, so a desync is both
+// bounded and visible.
+class TxAdpcmDecoder : public ADPCMDecoder {
+public:
+  using ADPCMDecoder::ADPCMDecoder;
+
+  // Bytes of a partial block held from earlier writes.
+  int pendingBytes() const { return current_byte; }
+
+  // Forget a partial block; returns how many bytes were dropped.
+  int realign() {
+    int dropped = current_byte;
+    current_byte = 0;
+    return dropped;
+  }
+
+  uint32_t goodBlocks = 0;
+  uint32_t badBlocks = 0;  // Decoded to no samples (invalid header or data).
+
+protected:
+  bool decode(uint8_t byte) override {
+    if (p_decoder == nullptr) return false;
+    adpcm_block[current_byte++] = byte;
+    if (current_byte >= block_size) {
+      adpcm_ffmpeg::AVFrame &frame = p_decoder->decode(&adpcm_block[0], block_size);
+      if (frame.nb_samples == 0) {
+        badBlocks++;
+      } else {
+        goodBlocks++;
+        p_print->write((uint8_t *)frame.data[0], frame.nb_samples * sizeof(int16_t) * info.channels);
+      }
+      current_byte = 0;
+    }
+    return true;
+  }
+};
+
+TxAdpcmDecoder txAdpcmDecoder(AV_CODEC_ID_ADPCM_IMA_WAV, AUDIO_FRAME_BYTES);
 EncodedAudioStream txDecodeStream(&txVolumeMeter, &txAdpcmDecoder);
 
 // Tx runaway detection stuff
@@ -228,6 +277,12 @@ struct TxPlayoutStats {
   int64_t lastAudioWriteUs = 0;
   bool audioWritten = false;
   uint64_t blockedUsAtStart = 0;
+  // ADPCM framing (see TxAdpcmDecoder). Per transmission.
+  uint32_t badBlocksAtStart = 0;
+  uint32_t goodBlocksAtStart = 0;
+  uint32_t strayBytes = 0;          // Partial-block bytes dropped to realign.
+  uint32_t framesRejected = 0;      // Host frames that were not whole blocks.
+  bool desyncReported = false;
 };
 TxPlayoutStats txPlayout;
 
@@ -335,10 +390,34 @@ void endI2STx() {
   txStreamConfigured = false;
 }
 
+// Report a desync once per transmission, with a stable keyword hosts can match.
+static void txReportAdpcmDesync(const char *what) {
+  if (txPlayout.desyncReported) {
+    return;
+  }
+  txPlayout.desyncReported = true;
+  debug_log_printf(COMMAND_DEBUG_WARN, "TX ADPCM desync: %s; bad_blocks=%lu good_blocks=%lu stray_bytes=%lu rejected_frames=%lu",
+                   what, (unsigned long)(txAdpcmDecoder.badBlocks - txPlayout.badBlocksAtStart),
+                   (unsigned long)(txAdpcmDecoder.goodBlocks - txPlayout.goodBlocksAtStart),
+                   (unsigned long)txPlayout.strayBytes, (unsigned long)txPlayout.framesRejected);
+}
+
+// Every call starts on a block boundary (a chunk, or a whole frame of whole
+// blocks), so a partial block left in the decoder can only be a leftover:
+// drop it rather than let it shift this block.
 static void txDecode(const uint8_t *src, size_t len) {
+  int stray = txAdpcmDecoder.realign();
+  if (stray > 0) {
+    txPlayout.strayBytes += (uint32_t)stray;
+    txReportAdpcmDesync("partial block before a block boundary, realigned");
+  }
+  uint32_t badBefore = txAdpcmDecoder.badBlocks;
   uint64_t before = txOutCounter.bytes;
   txDecodeStream.write(src, len);
   txPlayout.playedSamples48k += (txOutCounter.bytes - before) / sizeof(int16_t);
+  if (txAdpcmDecoder.badBlocks != badBefore) {
+    txReportAdpcmDesync("block decoded to no audio");
+  }
 }
 
 static void txAfterAudioWrite() {
@@ -390,6 +469,13 @@ void txPlayoutBegin(bool hostVoice) {
   txPlayout.blockedUsAtStart = txOutCounter.blockedUs;
   txPlayout.anchorUs = esp_timer_get_time();
   txPlayout.anchorBytes = txOutCounter.bytes;
+  // A new over always starts on a block boundary, whatever the last one left.
+  txPlayout.strayBytes = (uint32_t)txAdpcmDecoder.realign();
+  txPlayout.badBlocksAtStart = txAdpcmDecoder.badBlocks;
+  txPlayout.goodBlocksAtStart = txAdpcmDecoder.goodBlocks;
+  if (txPlayout.strayBytes > 0) {
+    txReportAdpcmDesync("previous transmission ended inside a block, realigned at key-down");
+  }
 }
 
 // Called when leaving MODE_TX. Anything still buffered is discarded, but its
@@ -454,6 +540,17 @@ void processTxAudio(ProtocolSession &session, uint8_t *src, size_t len) {
   }
   uint32_t now = millis();
   txWatchDog.onFrame(now);
+  if (len % AUDIO_FRAME_BYTES != 0) {
+    // Not whole ADPCM blocks: bytes were lost or added on the way (for
+    // example a full receive ring). Decoding it would shift every block
+    // after it, so drop the frame; its credit goes back with the frame ack.
+    txPlayout.framesRejected++;
+    char what[64];
+    snprintf(what, sizeof(what), "frame of %u bytes is not whole %u-byte blocks, dropped", (unsigned)len,
+             (unsigned)AUDIO_FRAME_BYTES);
+    txReportAdpcmDesync(what);
+    return;
+  }
   if (!txPlayout.prerollChosen) {
     txJitter.setPrerollMs(&session == &protocolUsbSession ? TX_PREROLL_USB_MS : TX_PREROLL_WIRELESS_MS);
     txPlayout.prerollChosen = true;

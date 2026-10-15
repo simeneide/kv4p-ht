@@ -369,6 +369,29 @@ the first version with its 4 KB static buffer. The heap is 8 KB smaller
 instead; free and minimum free heap are printed at boot and in each TX
 summary (`heap`, `min`).
 
+### ADPCM block alignment
+
+The library ADPCM decoder fills a 128-byte block and decodes it when full, and
+it is never re-begun (not safe on the pinned library), so its position inside
+a block carried over from one transmission and one host session to the next.
+A single payload that was not a whole number of blocks (bytes lost in the BLE
+receive ring, which drops bytes silently when full) shifted every later block.
+A shifted IMA WAV header reads a reserved byte into the step index, the
+library rejects the block and outputs nothing, and playout fills with silence:
+a carrier with no audio on every over until the ESP32 restarts.
+
+Now the block position is reset at every key-down and before every chunk, a
+host frame that is not whole blocks is dropped (its credit still returns), and
+rejected blocks are counted. Any of these, once per transmission, logs
+
+```
+TX ADPCM desync: <what happened>; bad_blocks=N good_blocks=N stray_bytes=N rejected_frames=N
+```
+
+and the TX summary carries `adpcm_bad`, `adpcm_stray`, `adpcm_rejected` and
+`ble_rx_overflow` (receive-ring bytes dropped since boot). A desync now costs
+at most the frame or block it happened in.
+
 ### TX summary line
 
 When a voice transmission ends, one `COMMAND_DEBUG_INFO` line is sent to
