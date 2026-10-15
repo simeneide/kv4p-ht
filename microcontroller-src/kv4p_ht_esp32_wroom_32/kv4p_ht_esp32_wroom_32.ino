@@ -456,6 +456,62 @@ void reconcileDesiredState(bool sendReport = true) {
   }
 }
 
+// A key refused because the TX driver could not be installed (i2sGuard.h).
+// The heap shortage is usually brief (Bluetooth buffers draining), so while
+// the host still asks for PTT the key is retried every TX_KEY_RETRY_MS, at
+// most TX_KEY_MAX_ATTEMPTS times per press. Receive keeps running meanwhile.
+static constexpr uint32_t TX_KEY_RETRY_MS = 250;
+static constexpr uint32_t TX_KEY_MAX_ATTEMPTS = 8;
+static uint32_t txKeyRefusedAtMs = 0;
+static bool txKeyRetryPending = false;
+static uint32_t txKeyRefusalsThisPress = 0;
+static uint32_t txKeyRetriesLastOver = 0;
+static uint32_t txKeyRefusalsTotal = 0;
+
+static bool txKeyBackoffActive() {
+  return txKeyRefusalsTotal != 0 && (uint32_t)(millis() - txKeyRefusedAtMs) < TX_KEY_RETRY_MS;
+}
+
+static void txKeyRefused() {
+  ++txKeyRefusalsThisPress;
+  ++txKeyRefusalsTotal;
+  txKeyRefusedAtMs = millis();
+  txKeyRetryPending = true;
+  // Once at the first refusal and once when giving up, so a congested link
+  // is not flooded with the same line.
+  if (txKeyRefusalsThisPress == 1 || txKeyRefusalsThisPress == TX_KEY_MAX_ATTEMPTS) {
+    debug_log_printf(COMMAND_DEBUG_WARN,
+                     "TX refused: I2S driver install failed, attempt %lu of %lu%s; dma_free=%lu dma_largest=%lu "
+                     "internal_free=%lu refusals=%lu",
+                     (unsigned long)txKeyRefusalsThisPress, (unsigned long)TX_KEY_MAX_ATTEMPTS,
+                     txKeyRefusalsThisPress == TX_KEY_MAX_ATTEMPTS ? ", giving up until PTT is released" : "",
+                     (unsigned long)txKeyHeap.dmaFree, (unsigned long)txKeyHeap.dmaLargest,
+                     (unsigned long)txKeyHeap.internalFree, (unsigned long)txKeyRefusalsTotal);
+  }
+}
+
+static void txKeyAccepted() {
+  txKeyRetriesLastOver = txKeyRefusalsThisPress;
+  txKeyRefusalsThisPress = 0;
+  txKeyRetryPending = false;
+}
+
+void txKeyRetryLoop() {
+  if (!txKeyRetryPending || mode == MODE_TX) {
+    return;
+  }
+  if ((desiredState.flags & HOST_STATE_PTT_REQUESTED) == 0) {
+    // Released: the next press starts a fresh set of attempts.
+    txKeyRetryPending = false;
+    txKeyRefusalsThisPress = 0;
+    return;
+  }
+  if (txKeyRefusalsThisPress >= TX_KEY_MAX_ATTEMPTS || txKeyBackoffActive()) {
+    return;
+  }
+  reconcileDesiredState(false);
+}
+
 void setMode(Mode newMode) {
   if (mode == newMode) {
     return;
@@ -486,7 +542,35 @@ void setMode(Mode newMode) {
       digitalWrite(hw.pins.pinPtt, LOW);
 #endif
       endI2SRx();
-      initI2STx();
+#ifdef KV4P_TEST_STARVE_I2S
+      // Bench-only fault injection: hold the DMA heap in 1 KB pieces for the
+      // first KV4P_TEST_STARVE_I2S attempts of every press, so the TX driver
+      // install fails the way it does when Bluetooth has the heap.
+      static void *starveHog[96];
+      size_t starveHeld = 0;
+      if (txKeyRefusalsThisPress < KV4P_TEST_STARVE_I2S) {
+        while (starveHeld < 96 && heap_caps_get_largest_free_block(MALLOC_CAP_DMA) >= 1024) {
+          starveHog[starveHeld] = heap_caps_malloc(1024, MALLOC_CAP_DMA);
+          if (starveHog[starveHeld] == nullptr) break;
+          ++starveHeld;
+        }
+      }
+      bool txInstalled = initI2STx();
+      for (size_t i = 0; i < starveHeld; ++i) heap_caps_free(starveHog[i]);
+      if (!txInstalled) {
+#else
+      if (!initI2STx()) {
+#endif
+        // The TX DMA ring did not fit in the heap. Unkey before anything was
+        // played, go back to receive, and let txKeyRetryLoop() try again.
+        digitalWrite(hw.pins.pinPtt, HIGH);
+        mode = rxIdleMode();
+        initI2SRx();
+        txKeyRefused();
+        markDeviceStateDirty();
+        return;
+      }
+      txKeyAccepted();
       txPlayoutBegin((desiredState.flags & HOST_STATE_PTT_REQUESTED) != 0);
       bleKissStream.resetRxGapStats();
       if (txPlayout.hostVoice && protocolHasBleSession() && bleKissStream.requestConnParamsIfNeeded()) {
@@ -533,7 +617,8 @@ void logTxSummary() {
                    "reached=%s@%lu ms underruns=%lu gap_silence=%lu ms lead_silence=%lu ms max_frame_gap=%lu ms "
                    "max_ble_write_gap=%lu ms peak=%lu B (%lu ms) overflows=%lu late=%lu i2s_blocked=%lu ms discarded=%lu drain=%lu ms "
                    "ble=%s interval=%u.%02u ms latency=%u mtu=%u dle=%u/%u heap=%u min=%u credit_held=%lu B "
-                   "carrier_lead=%lu ms adpcm_bad=%lu adpcm_stray=%lu adpcm_rejected=%lu ble_rx_overflow=%lu",
+                   "carrier_lead=%lu ms adpcm_bad=%lu adpcm_stray=%lu adpcm_rejected=%lu ble_rx_overflow=%lu "
+                   "key_dma_free=%lu key_dma_largest=%lu key_retries=%lu tx_driver_dma=%lu",
                    (unsigned long)keyedMs, (unsigned long)js.framesIn, (unsigned long)js.bytesIn,
                    (unsigned long)js.framesOut, (unsigned long)audioMs, (unsigned long)txJitter.prerollMs(),
                    js.prerollReached ? "yes" : "no", (unsigned long)js.prerollReachedMs, (unsigned long)js.underruns,
@@ -550,7 +635,9 @@ void logTxSummary() {
                    (unsigned long)js.peakHeldAckBytes, (unsigned long)txJitter.leadMs(),
                    (unsigned long)(txAdpcmDecoder.badBlocks - txPlayout.badBlocksAtStart),
                    (unsigned long)txPlayout.strayBytes, (unsigned long)txPlayout.framesRejected,
-                   (unsigned long)bleKissStream.stats().rxIncomingOverflowDrops);
+                   (unsigned long)bleKissStream.stats().rxIncomingOverflowDrops,
+                   (unsigned long)txKeyHeap.dmaFree, (unsigned long)txKeyHeap.dmaLargest,
+                   (unsigned long)txKeyRetriesLastOver, (unsigned long)txDriverDmaBytes);
 }
 
 // Put the RF module's control lines in a known state before anything else.
@@ -895,7 +982,9 @@ void ax25TxLoop() {
   const Ax25TxJob *job = ax25TxScheduler.head();
   if (job == nullptr) return;
 
+  if (txKeyBackoffActive()) return;
   setMode(MODE_TX);
+  if (mode != MODE_TX) return;  // Refused (i2sGuard.h); the job stays queued.
   latestRssi = (uint8_t)TX_AUDIO_LEVEL_FULL_SCALE_RSSI;
   txAudioLevel = TX_AUDIO_LEVEL_FULL_SCALE_RSSI;
   sendCurrentDeviceState();
@@ -1067,6 +1156,7 @@ void loop() {
   rxAudioLoop();
   ax25TxLoop();
   txAudioLoop();
+  txKeyRetryLoop();
   rssiLoop();
   radioModuleProbeLoop();
   deviceStateLoop();

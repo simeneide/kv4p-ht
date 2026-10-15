@@ -28,6 +28,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "globals.h"
 #include "protocol.h"
 #include "debug.h"
+#include "i2sGuard.h"
 #include "dsp/audioResampler.h"
 #include "dsp/softSquelchEffect.h"
 #include "freeDvSquelch.h"
@@ -208,6 +209,10 @@ inline void setUpADCAttenuator() {
   adc1_config_channel_atten(I2S_ADC_CHANNEL, hw.adcAttenuation);
 }
 
+static uint32_t rxStartFailures = 0;
+static uint32_t rxStartFailedAtMs = 0;
+static constexpr uint32_t RX_START_RETRY_MS = 500;
+
 void initI2SRx() {
   if (rxStreamConfigured) {
     return;
@@ -222,7 +227,18 @@ void initI2SRx() {
   config.auto_clear = false;
   config.adc_pin = hw.pins.pinAudioIn;
   config.sample_rate = RX_ADC_SAMPLE_RATE;
-  in.begin(config);
+  if (!in.begin(config) || !i2sGuardInstalled(I2S_NUM_0)) {
+    // No DMA heap for the RX ring either. rxAudioLoop() tries again; until
+    // then nothing is read from the missing driver (i2sGuard.h).
+    in.end();
+    if (rxStartFailures++ == 0 || rxStartFailures % 20 == 0) {
+      debug_log_printf(COMMAND_DEBUG_WARN, "RX audio start failed: I2S driver install failed; failures=%lu dma_free=%lu dma_largest=%lu",
+                       (unsigned long)rxStartFailures, (unsigned long)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                       (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    }
+    rxStartFailedAtMs = millis();
+    return;
+  }
   // effects
   effects.clear();
   afskTapEffect.setActive(true);
@@ -255,6 +271,13 @@ void endI2SRx() {
   
 void rxAudioLoop() {
   softSquelchEffect.setHardwareSquelched(digitalRead(hw.pins.pinSq) == HIGH);
+  if ((mode == MODE_RX || mode == MODE_STOPPED) && !rxStreamConfigured) {
+    if ((uint32_t)(millis() - rxStartFailedAtMs) >= RX_START_RETRY_MS) {
+      initI2SRx();
+    }
+    esp_task_wdt_reset();
+    return;
+  }
   if (mode == MODE_RX || mode == MODE_STOPPED) {
     mute.setActive(squelched);
     rxCopier.copy();

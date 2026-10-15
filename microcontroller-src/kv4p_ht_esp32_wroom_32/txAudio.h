@@ -29,6 +29,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "utils.h"
 #include "dsp/audioResampler.h"
 #include "txJitterBuffer.h"
+#include "i2sGuard.h"
 
 // TX playout jitter buffer. See microcontroller-src/docs/ble-robustness.md.
 //
@@ -353,7 +354,15 @@ static bool txPlayoutAudioInFlight() {
     && (esp_timer_get_time() - txPlayout.lastAudioWriteUs) < (int64_t)TX_PLAYOUT_FLUSH_US;
 }
 
-void initI2STx() {  
+// The DMA heap just before the last TX driver install, for the TX summary and
+// the refusal line.
+I2sGuardHeap txKeyHeap = {};
+// What the installed TX driver took from the DMA heap (0 until one installs).
+uint32_t txDriverDmaBytes = 0;
+
+// Returns false, with nothing installed, when the TX driver could not be
+// installed (its DMA ring did not fit in the heap). The caller must not key.
+bool initI2STx() {
   freeDvTx.setMagnitude(16383);
   auto config = out.defaultConfig(TX_MODE);
   config.copyFrom(txInfo);
@@ -365,7 +374,17 @@ void initI2STx() {
   // Playout pacing below depends on this DMA geometry; set it explicitly.
   config.buffer_count = TX_DMA_BUFFER_COUNT;
   config.buffer_size = TX_DMA_BUFFER_SAMPLES_48K;
+  txKeyHeap = i2sGuardHeapNow();
   out.begin(config);
+  if (!i2sGuardInstalled(I2S_NUM_0)) {
+    // begin() went on past the failed install; i2sGuard.h kept its later
+    // calls off the missing driver. end() only resets the wrapper's state.
+    out.end();
+    txStreamConfigured = false;
+    return false;
+  }
+  uint32_t dmaFreeAfter = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_DMA);
+  txDriverDmaBytes = txKeyHeap.dmaFree > dmaFreeAfter ? txKeyHeap.dmaFree - dmaFreeAfter : 0;
   txUpsample.begin();
   txVolumeMeter.begin(txAudioInfo);
   if (!txDecodeStreamStarted) {
@@ -377,6 +396,7 @@ void initI2STx() {
   // Subsequent audio frames update this to the measured TX audio level.
   updateTxAudioLevel(1.0f);
   txStreamConfigured = true;
+  return true;
 }
 
 void endI2STx() {
