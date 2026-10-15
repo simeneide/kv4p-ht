@@ -22,6 +22,10 @@ changes are aimed at upstream and are described in detail in
 * Keeps one damaged TX audio frame from silencing every later transmission:
   the ADPCM decoder realigns at every key-down and block, frames that are not
   whole blocks are dropped, and a `TX ADPCM desync:` line says so.
+* Never crashes at key-down when the TX audio driver cannot get its DMA
+  memory: the TX ring is mono (half the memory, the same as RX frees), every
+  I2S call is guarded, and a failed install refuses the key with a
+  `TX refused:` line and retries while PTT is held.
 * Requests LE data length 251 and iOS-friendly BLE connection parameters.
 * Buffers TX audio from the host and plays it out at the DAC's pace, so a
   congested Bluetooth link (for example with a headset microphone open) gives

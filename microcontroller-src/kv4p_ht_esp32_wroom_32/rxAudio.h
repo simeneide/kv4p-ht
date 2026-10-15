@@ -210,6 +210,7 @@ inline void setUpADCAttenuator() {
 }
 
 static uint32_t rxStartFailures = 0;
+static uint32_t rxStartEpisodeFailures = 0;
 static uint32_t rxStartFailedAtMs = 0;
 static constexpr uint32_t RX_START_RETRY_MS = 500;
 
@@ -227,17 +228,43 @@ void initI2SRx() {
   config.auto_clear = false;
   config.adc_pin = hw.pins.pinAudioIn;
   config.sample_rate = RX_ADC_SAMPLE_RATE;
+#ifdef KV4P_TEST_STARVE_I2S_RX
+  // Bench-only fault injection: the first RX start after each transmission
+  // (every even call; the boot one is spared, since Bluetooth is starting
+  // then) finds the DMA heap held in 1 KB pieces.
+  static uint32_t rxStarveCalls = 0;
+  static void *rxStarveHog[96];
+  size_t rxStarveHeld = 0;
+  if (++rxStarveCalls % 2 == 0) {
+    while (rxStarveHeld < 96 && heap_caps_get_largest_free_block(MALLOC_CAP_DMA) >= 1024) {
+      rxStarveHog[rxStarveHeld] = heap_caps_malloc(1024, MALLOC_CAP_DMA);
+      if (rxStarveHog[rxStarveHeld] == nullptr) break;
+      ++rxStarveHeld;
+    }
+  }
+  bool rxInstalled = in.begin(config) && i2sGuardInstalled(I2S_NUM_0);
+  for (size_t i = 0; i < rxStarveHeld; ++i) heap_caps_free(rxStarveHog[i]);
+  if (!rxInstalled) {
+#else
   if (!in.begin(config) || !i2sGuardInstalled(I2S_NUM_0)) {
+#endif
     // No DMA heap for the RX ring either. rxAudioLoop() tries again; until
     // then nothing is read from the missing driver (i2sGuard.h).
     in.end();
-    if (rxStartFailures++ == 0 || rxStartFailures % 20 == 0) {
-      debug_log_printf(COMMAND_DEBUG_WARN, "RX audio start failed: I2S driver install failed; failures=%lu dma_free=%lu dma_largest=%lu",
-                       (unsigned long)rxStartFailures, (unsigned long)heap_caps_get_free_size(MALLOC_CAP_DMA),
-                       (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    ++rxStartFailures;
+    // Once per episode, and every 20th attempt while it lasts.
+    if (rxStartEpisodeFailures++ % 20 == 0) {
+      debug_log_printf(COMMAND_DEBUG_WARN,
+                       "RX audio start failed: I2S driver install failed, attempt %lu; dma_free=%lu dma_largest=%lu failures=%lu",
+                       (unsigned long)rxStartEpisodeFailures, (unsigned long)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                       (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA), (unsigned long)rxStartFailures);
     }
     rxStartFailedAtMs = millis();
     return;
+  }
+  if (rxStartEpisodeFailures != 0) {
+    debug_log_printf(COMMAND_DEBUG_INFO, "RX audio started after %lu failed attempts", (unsigned long)rxStartEpisodeFailures);
+    rxStartEpisodeFailures = 0;
   }
   // effects
   effects.clear();

@@ -145,6 +145,52 @@ configuration. At boot the handshake also pulses power-down after every third
 silent attempt. PTT and power-down are driven before Bluetooth starts, so a
 module is never left keyed by a floating pin while the ESP32 boots.
 
+### A key-down never crashes on a full heap
+
+Receive and transmit share I2S0 in different modes (built-in ADC, then PDM),
+so every key-down uninstalls the RX driver and installs the TX driver, which
+allocates its DMA ring from DMA-capable heap right then. With Bluetooth up the
+heap runs at 19-29 KB free and fragments: on a slow link (48.75 ms interval,
+latency 5) the bench saw 18.6-19 KB free with an 8180-byte largest block at
+key-down, and the old stereo ring (6 x 2048 bytes, 13 KB with descriptors) did
+not fit. IDF then frees the half-built driver, arduino-audio-tools ignores the
+error and calls `i2s_set_pin()` on a NULL driver: LoadProhibited at EXCVADDR
+0x3c, and the radio reboots as the pilot presses PTT (the stored fw18 core
+dump, and a fw19 panic on 2026-10-15). Four of twelve slow-link overs on the
+bench hit it.
+
+Two changes:
+
+* The TX ring is mono (`I2S_CHANNEL_FMT_ONLY_RIGHT`): 6 x 1024 bytes, about
+  6.9 KB, the same as the RX ring that was just freed. The PDM pin carries the
+  same signal (same level, speed and transcript on the bench) and each chunk
+  is written with one `i2s_write()` instead of one per sample. Set
+  `KV4P_TX_PDM_MONO=0` for the old stereo ring.
+* `i2sGuard.h` wraps every I2S port call at link time (`-Wl,--wrap`, see
+  `platformio.ini`). A call on a port with no installed driver returns
+  `ESP_ERR_INVALID_STATE` instead of dereferencing it. A failed TX install
+  unkeys before any audio is played, restarts RX and logs once, with a stable
+  prefix:
+
+  ```
+  TX refused: I2S driver install failed, attempt 1 of 8; dma_free=18972 dma_largest=8180 internal_free=33420 refusals=1
+  ```
+
+  While the host still asks for PTT the key is retried every 250 ms, at most
+  8 times per press (`..., giving up until PTT is released` on the last). A
+  failed RX start (`RX audio start failed: ...`) is retried every 500 ms, and
+  `RX audio started after N failed attempts` closes the episode. The TX
+  summary carries `key_dma_free`, `key_dma_largest`, `key_retries` and
+  `tx_driver_dma`. Two bench-only envs inject the failure:
+  `esp32dev-i2s-starve-test` (the first two key attempts of every press) and
+  `esp32dev-i2s-starve-rx-test` (the first RX start after every
+  transmission).
+
+Holding a DMA reserve through receive was considered and not done: it would
+take about 7 KB from Bluetooth for as long as the radio listens, and the
+Bluedroid stack aborts on a failed allocation (seen on the bench when a test
+build held the whole heap while Bluetooth started).
+
 ## 2. LE Data Length Extension
 
 File: `BluedroidBleKissGattStream.h`.

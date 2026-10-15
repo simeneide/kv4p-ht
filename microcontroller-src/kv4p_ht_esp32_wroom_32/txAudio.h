@@ -63,6 +63,9 @@ static constexpr uint32_t TX_CARRIER_LEAD_MS = 300;
 // at a time, whatever the frame size; a chunk decodes to at most
 // AUDIO_FRAME_SAMPLES_WIRE samples. The pacing counts the PCM actually
 // written, so it follows the real decoded length either way.
+#ifndef KV4P_TX_PDM_MONO
+#define KV4P_TX_PDM_MONO 1
+#endif
 static constexpr int TX_DMA_BUFFER_COUNT = 6;
 static constexpr int64_t TX_DMA_BUFFER_SAMPLES_48K = 512;
 static constexpr int64_t TX_DMA_RING_SAMPLES_48K = TX_DMA_BUFFER_COUNT * TX_DMA_BUFFER_SAMPLES_48K;
@@ -371,6 +374,15 @@ bool initI2STx() {
   config.use_apll = true;
   config.auto_clear = false;
   config.signal_type = PDM;
+#if KV4P_TX_PDM_MONO
+  // One channel in the DMA ring instead of a duplicated stereo pair: the PDM
+  // modulator drives one pin either way, so the air is the same, but the ring
+  // is 6 x 1 KB instead of 6 x 2 KB. That is what the RX driver frees at
+  // key-down, so the TX install no longer needs heap that Bluetooth may be
+  // holding (see i2sGuard.h). It also writes each chunk in one i2s_write()
+  // instead of one call per sample.
+  config.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
+#endif
   // Playout pacing below depends on this DMA geometry; set it explicitly.
   config.buffer_count = TX_DMA_BUFFER_COUNT;
   config.buffer_size = TX_DMA_BUFFER_SAMPLES_48K;
