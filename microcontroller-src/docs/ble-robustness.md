@@ -169,8 +169,9 @@ Two changes:
 * `i2sGuard.h` wraps every I2S port call at link time (`-Wl,--wrap`, see
   `platformio.ini`). A call on a port with no installed driver returns
   `ESP_ERR_INVALID_STATE` instead of dereferencing it. The TX driver is
-  installed before PTT is pulled, so a failed install never puts a carrier on
-  the air: the radio stays in receive, restarts RX and logs with a stable
+  installed before PTT is pulled and before the mode changes, so a failed
+  install never puts a carrier on the air and no DeviceState ever reports TX
+  for it: the radio stays in receive, restarts RX and logs with a stable
   prefix:
 
   ```
