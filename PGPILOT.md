@@ -3,8 +3,8 @@
 This repository is a fork of [VanceVagell/kv4p-ht](https://github.com/VanceVagell/kv4p-ht),
 maintained for [pgpilot](https://pgpilot.app), a paragliding app that uses a
 kv4p HT as a VHF radio over Bluetooth. Its firmware branch is
-`pgpilot/ble-robust`, and the firmware calls itself **18 pgpilot**
-(`FIRMWARE_VER = 18`).
+`pgpilot/reset-diagnostics` (it continues `pgpilot/ble-robust`, which
+shipped 18), and the firmware calls itself **19 pgpilot** (`FIRMWARE_VER = 19`).
 
 ## What it changes
 
@@ -19,13 +19,16 @@ changes are aimed at upstream and are described in detail in
   missing, probed again in the background (with power-down pulses) and
   configured once it answers. PTT and power-down are driven before Bluetooth
   starts.
+* Keeps one damaged TX audio frame from silencing every later transmission:
+  the ADPCM decoder realigns at every key-down and block, frames that are not
+  whole blocks are dropped, and a `TX ADPCM desync:` line says so.
 * Requests LE data length 251 and iOS-friendly BLE connection parameters.
 * Buffers TX audio from the host and plays it out at the DAC's pace, so a
   congested Bluetooth link (for example with a headset microphone open) gives
   steady audio instead of dropouts. Advertised with HELLO feature bit 7.
 * Cleaner start and end of each transmission: the first audio waits until the
   module has keyed, and the tail drains before unkey.
-* Names the build `18 pgpilot` in the boot banner, the reset reason line and
+* Names the build `19 pgpilot` in the boot banner, the reset reason line and
   the ESP-IDF app descriptor.
 
 The HELLO layout and every command are unchanged; only the version number
@@ -36,13 +39,13 @@ older firmware).
 
 GPL-3.0, like upstream (see [LICENSE](LICENSE)). The exact source of each
 binary pgpilot distributes is the tag it was built from, for example
-[`v18-pgpilot.1`](https://github.com/simeneide/kv4p-ht/tree/v18-pgpilot.1).
+[`v19-pgpilot.1`](https://github.com/simeneide/kv4p-ht/tree/v19-pgpilot.1).
 To rebuild it:
 
 ```sh
 git clone https://github.com/simeneide/kv4p-ht.git
 cd kv4p-ht
-git checkout v18-pgpilot.1
+git checkout v19-pgpilot.1
 cd microcontroller-src
 pio run -e esp32dev-release
 ```
