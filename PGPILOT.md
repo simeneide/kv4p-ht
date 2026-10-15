@@ -3,8 +3,9 @@
 This repository is a fork of [VanceVagell/kv4p-ht](https://github.com/VanceVagell/kv4p-ht),
 maintained for [pgpilot](https://pgpilot.app), a paragliding app that uses a
 kv4p HT as a VHF radio over Bluetooth. Its firmware branch is
-`pgpilot/reset-diagnostics` (it continues `pgpilot/ble-robust`, which
-shipped 18), and the firmware calls itself **19 pgpilot** (`FIRMWARE_VER = 19`).
+`pgpilot/i2s-tx-guard` (it continues `pgpilot/reset-diagnostics`, which
+shipped 19, and `pgpilot/ble-robust`, which shipped 18), and the firmware
+calls itself **20 pgpilot** (`FIRMWARE_VER = 20`).
 
 ## What it changes
 
@@ -25,14 +26,15 @@ changes are aimed at upstream and are described in detail in
 * Never crashes at key-down when the TX audio driver cannot get its DMA
   memory: the TX ring is mono (half the memory, the same as RX frees), every
   I2S call is guarded, and a failed install refuses the key with a
-  `TX refused:` line and retries while PTT is held.
+  `TX refused:` line, without keying the carrier, and retries a few times
+  while PTT is held.
 * Requests LE data length 251 and iOS-friendly BLE connection parameters.
 * Buffers TX audio from the host and plays it out at the DAC's pace, so a
   congested Bluetooth link (for example with a headset microphone open) gives
   steady audio instead of dropouts. Advertised with HELLO feature bit 7.
 * Cleaner start and end of each transmission: the first audio waits until the
   module has keyed, and the tail drains before unkey.
-* Names the build `19 pgpilot` in the boot banner, the reset reason line and
+* Names the build `20 pgpilot` in the boot banner, the reset reason line and
   the ESP-IDF app descriptor.
 
 The HELLO layout and every command are unchanged; only the version number

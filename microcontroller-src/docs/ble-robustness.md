@@ -168,21 +168,28 @@ Two changes:
   `KV4P_TX_PDM_MONO=0` for the old stereo ring.
 * `i2sGuard.h` wraps every I2S port call at link time (`-Wl,--wrap`, see
   `platformio.ini`). A call on a port with no installed driver returns
-  `ESP_ERR_INVALID_STATE` instead of dereferencing it. A failed TX install
-  unkeys before any audio is played, restarts RX and logs once, with a stable
+  `ESP_ERR_INVALID_STATE` instead of dereferencing it. The TX driver is
+  installed before PTT is pulled, so a failed install never puts a carrier on
+  the air: the radio stays in receive, restarts RX and logs with a stable
   prefix:
 
   ```
-  TX refused: I2S driver install failed, attempt 1 of 8; dma_free=18972 dma_largest=8180 internal_free=33420 refusals=1
+  TX refused: I2S driver install failed, attempt 1 of 8; source=ptt dma_free=18972 dma_largest=8180 internal_free=33420 refusals=1
   ```
 
-  While the host still asks for PTT the key is retried every 250 ms, at most
-  8 times per press (`..., giving up until PTT is released` on the last). A
+  `TxKeyRetryPolicy` (`txKeyPolicy.h`, native tests in `test_tx_key_retry`)
+  gates every key attempt, from whichever path: a host state write, a
+  reconnect, a probe or the retry loop. Attempts after a refusal are at
+  least 250 ms apart, at most 8 per press (`source=ptt`, `..., giving up
+  until PTT is released` on the last) or per AX.25 job (`source=ax25`, then
+  `..., dropping the AX.25 frame`), and the line is logged only at the first
+  refusal and on giving up. A
   failed RX start (`RX audio start failed: ...`) is retried every 500 ms, and
   `RX audio started after N failed attempts` closes the episode. The TX
-  summary carries `key_dma_free`, `key_dma_largest`, `key_retries` and
-  `tx_driver_dma`. Two bench-only envs inject the failure:
-  `esp32dev-i2s-starve-test` (the first two key attempts of every press) and
+  summary carries `key_dma_free`, `key_dma_largest`, `key_retries`,
+  `tx_driver_dma`, `i2s_blocked_calls` and `i2s_install_failures`. Bench-only
+  envs inject the failure: `esp32dev-i2s-starve-test` (two key attempts out of
+  every three), `esp32dev-i2s-starve-all-test` (every key attempt) and
   `esp32dev-i2s-starve-rx-test` (the first RX start after every
   transmission).
 
@@ -530,15 +537,15 @@ The proper fix is a newer Bluedroid. What that would take:
   of the Arduino libraries (esp32-arduino-lib-builder), or use NimBLE for BLE in
   a BLE-only build (Classic SPP needs Bluedroid).
 
-## 6. Version 19 and the firmware label
+## 6. Version 20 and the firmware label
 
 Files: `firmwareVersion.h`, `tools/set_app_version.py`, `platformio.ini`.
 
-This fork reports `FIRMWARE_VER = 19` in HELLO (upstream is 17), and names
-itself `19 pgpilot` (`FIRMWARE_LABEL`) in three places:
+This fork reports `FIRMWARE_VER = 20` in HELLO (upstream is 17), and names
+itself `20 pgpilot` (`FIRMWARE_LABEL`) in three places:
 
-* the USB boot banner (`Firmware 19 pgpilot (pgpilot fork: ...)`),
-* the per-connect `Reset reason` debug line (`...; boot #4; fw 19 pgpilot; ...`),
+* the USB boot banner (`Firmware 20 pgpilot (pgpilot fork: ...)`),
+* the per-connect `Reset reason` debug line (`...; boot #4; fw 20 pgpilot; ...`),
   placed before the long description so it survives a host that keeps only
   the first 120 characters,
 * the ESP-IDF app descriptor in `firmware.bin`. Arduino-ESP32 links a
@@ -547,28 +554,29 @@ itself `19 pgpilot` (`FIRMWARE_LABEL`) in three places:
   script rewrites the descriptor's `version` to the label and `project_name`
   to `kv4p-ht-pgpilot` in the ELF, before `elf2image`, so the image checksum
   and hashes stay valid. `esptool.py --chip esp32 image_info --version 2
-  firmware.bin` then shows `App version: 19 pgpilot`. The compile time and
+  firmware.bin` then shows `App version: 20 pgpilot`. The compile time and
   date fields still come from the precompiled library.
 
 Only the version number changes on the wire; the HELLO layout, the features
 byte (bit 7 already advertises the TX jitter buffer) and every command are as
 before.
 
-Compatibility of the numbers 18 and 19 (18 was the first beta; 19 adds the
-SA818 recovery, the extra reset reason lines and the ADPCM realignment):
+Compatibility of the numbers 18 to 20 (18 was the first beta; 19 adds the
+SA818 recovery, the extra reset reason lines and the ADPCM realignment; 20
+adds the I2S guard and the mono TX ring):
 
 * **Upstream Android app.** `RadioAudioService.validateHello()` only rejects
   firmware *older* than `FirmwareUtils.PACKAGED_FIRMWARE_VER` (17); there is no
-  "firmware newer than app" check, so 18 and 19 connect normally. Its Settings
+  "firmware newer than app" check, so 18 to 20 connect normally. Its Settings
   screen shows the number. It never offers to flash automatically when the radio is newer,
   but flashing from that app installs its packaged 17, which removes this
   fork's changes.
 * **pgpilot.** Treats any version at or above its default set (17) as up to
-  date, so a radio on 18 or 19 is not prompted to downgrade. It ships this build as
+  date, so a radio on 18 to 20 is not prompted to downgrade. It ships this build as
   an opt-in beta set on its flasher.
 * **The firmware itself** uses `FIRMWARE_VER` only in HELLO and one log line.
 
-When upstream releases its own 18 or 19, the numbers will collide. The label and
+When upstream releases its own 18, 19 or 20, the numbers will collide. The label and
 the app descriptor still tell the two apart; bump the fork past upstream
 before the next tag if that happens.
 

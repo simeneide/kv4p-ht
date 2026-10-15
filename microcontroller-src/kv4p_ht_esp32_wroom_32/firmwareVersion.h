@@ -26,5 +26,5 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // leading number equal to FIRMWARE_VER. tools/set_app_version.py reads the
 // label from this file and writes it into the ESP-IDF app descriptor, which
 // `esptool.py image_info` and flashers read.
-const uint16_t FIRMWARE_VER = 19;
-#define FIRMWARE_LABEL "19 pgpilot"
+const uint16_t FIRMWARE_VER = 20;
+#define FIRMWARE_LABEL "20 pgpilot"

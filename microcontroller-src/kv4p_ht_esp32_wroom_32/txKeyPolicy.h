@@ -17,6 +17,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
 
+#include <stdint.h>
+
 // What one pass of reconcileDesiredState() does with the transmitter.
 //
 // Pure so it can be unit tested natively. The rules:
@@ -68,3 +70,52 @@ inline TxReconcilePlan planTxReconcile(const TxReconcileInput &in) {
   }
   return plan;
 }
+
+// Key attempts that the firmware refused because the TX audio driver could not
+// be installed (i2sGuard.h). One instance per source of keys: the host's PTT
+// and the AX.25 scheduler. An episode is one press, or one AX.25 job.
+//
+//  - The first attempt of an episode is never delayed.
+//  - After a refusal the next attempt waits TX_KEY_RETRY_MS from the last
+//    attempt, whoever asks for it (a host state write, a reconnect, a probe or
+//    the retry loop): every path goes through mayAttempt().
+//  - After TX_KEY_MAX_ATTEMPTS refusals the episode gives up until it ends.
+//  - A refusal is logged only at the first and at giving up.
+static constexpr uint32_t TX_KEY_RETRY_MS = 250;
+static constexpr uint32_t TX_KEY_MAX_ATTEMPTS = 8;
+
+struct TxKeyRetryPolicy {
+  uint32_t lastAttemptMs = 0;
+  uint32_t refusals = 0;            // In this episode.
+  uint32_t refusalsTotal = 0;       // Since boot.
+  uint32_t lastEpisodeRetries = 0;  // Refusals before the last accepted key.
+
+  bool gaveUp() const { return refusals >= TX_KEY_MAX_ATTEMPTS; }
+
+  bool mayAttempt(uint32_t nowMs) const {
+    if (refusals == 0) return true;
+    if (gaveUp()) return false;
+    return (uint32_t)(nowMs - lastAttemptMs) >= TX_KEY_RETRY_MS;
+  }
+
+  // A retry is owed: refused, not given up, and the backoff has passed.
+  bool retryDue(uint32_t nowMs) const { return refusals != 0 && mayAttempt(nowMs); }
+
+  void attempting(uint32_t nowMs) { lastAttemptMs = nowMs; }
+
+  // Returns whether this refusal should be logged.
+  bool refused(uint32_t nowMs) {
+    lastAttemptMs = nowMs;
+    ++refusals;
+    ++refusalsTotal;
+    return refusals == 1 || refusals == TX_KEY_MAX_ATTEMPTS;
+  }
+
+  void accepted() {
+    lastEpisodeRetries = refusals;
+    refusals = 0;
+  }
+
+  // The press was released, or the job is finished or dropped.
+  void endEpisode() { refusals = 0; }
+};

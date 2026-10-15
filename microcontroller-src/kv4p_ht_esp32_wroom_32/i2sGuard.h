@@ -20,8 +20,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Keep a failed i2s_driver_install() from becoming a crash.
 //
 // Every key-down uninstalls the RX (built-in ADC) driver on I2S0 and installs
-// the TX (PDM) driver, which allocates its DMA ring (6 x 2048 bytes of
-// DMA-capable RAM) right then. When that allocation fails, IDF 4.4 frees the
+// the TX (PDM) driver, which allocates its DMA ring (6 x 1024 bytes of
+// DMA-capable RAM with the mono ring in txAudio.h, 6 x 2048 with the old
+// stereo one) right then. When that allocation fails, IDF 4.4 frees the
 // half-built driver and leaves p_i2s[0] NULL. arduino-audio-tools'
 // I2SDriverESP32::begin() logs the failure and carries on into i2s_set_pin(),
 // which dereferences p_i2s[0] (LoadProhibited, EXCVADDR 0x3c): the radio
