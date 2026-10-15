@@ -309,7 +309,14 @@ uint16_t appliedFilterFlags() {
 // marked lost, and radioModuleProbeLoop() looks for it again.
 static constexpr int SA818_COMMAND_ATTEMPTS = 3;
 
+// Probes since the module went missing (radioModuleProbeLoop()); reset by
+// radioModuleFound() and markRadioModuleLost() so every episode starts the same.
+uint32_t sa818Probes = 0;
+
+bool sa818Handshake(uint32_t timeoutMs);
+
 void markRadioModuleLost() {
+  sa818Probes = 0;
   if (radioModuleStatus == RADIO_MODULE_FOUND) {
     radioBootInfo.lostCount++;
     radioBootInfo.present = false;
@@ -333,7 +340,12 @@ bool sa818Command(const std::function<bool()> &command, uint8_t errorCode) {
     }
     lastDeviceStateError = errorCode;
   }
-  markRadioModuleLost();
+  // The library cannot tell a refusal from silence. A module that still
+  // answers a handshake is there and only refused this command: keep it, so
+  // a module that NAKs is not marked lost, re-found and refused again forever.
+  if (!sa818Handshake(SA818_PROBE_ANSWER_MS)) {
+    markRadioModuleLost();
+  }
   return false;
 }
 
@@ -386,7 +398,14 @@ void reconcileDesiredState(bool sendReport = true) {
     applyFilterFlags();
   }
 
-  if ((desiredState.flags & HOST_STATE_RADIO_CONFIG_VALID) && radioConfigChanged()
+  bool retuneWanted = (desiredState.flags & HOST_STATE_RADIO_CONFIG_VALID) && radioConfigChanged();
+  if (retuneWanted && mode == MODE_TX && radioModuleStatus == RADIO_MODULE_FOUND) {
+    // A retune while PTT is held: drop the carrier first, so group() (up to
+    // 3 x 2 s if the module does not answer) never runs keyed. Key again
+    // below once the new channel is applied.
+    setMode(rxIdleMode());
+  }
+  if (retuneWanted
       && sa818Command([&] {
            drainRadioSerial();
            return sa818.group(desiredState.bw, desiredState.freq_tx, desiredState.freq_rx, desiredState.ctcss_tx, 0, 0);
@@ -406,6 +425,13 @@ void reconcileDesiredState(bool sendReport = true) {
     radioConfigApplied = true;
   }
 
+  // Never key a module that is missing, or one still on a channel other than
+  // the one asked for (a retune that failed): end idle instead.
+  bool radioReady = radioModuleStatus == RADIO_MODULE_FOUND
+    && !((desiredState.flags & HOST_STATE_RADIO_CONFIG_VALID) && radioConfigChanged());
+  if (plan.end != TxReconcileEnd::Idle && !radioReady) {
+    plan.end = TxReconcileEnd::Idle;
+  }
   switch (plan.end) {
     case TxReconcileEnd::Key:
       // A re-press while draining continues the same over.
@@ -545,9 +571,11 @@ void earlyRadioPinsSetup() {
 }
 
 void setup() {
-  resetDiagnosticsBegin();
+  // Pins first: resetDiagnosticsBegin() writes NVS and scans the core dump,
+  // and PTT must not float meanwhile.
   boardSetup();
   earlyRadioPinsSetup();
+  resetDiagnosticsBegin();
   loadPersistedRadioState();
   // Communication with Android via USB cable
   Serial.setRxBufferSize(USB_BUFFER_SIZE);
@@ -687,6 +715,7 @@ void pulseRadioPowerDown() {
 
 void radioModuleFound() {
   radioModuleStatus = RADIO_MODULE_FOUND;
+  sa818Probes = 0;
   radioBootInfo.found = true;
   radioBootInfo.present = true;
   if (radioBootInfo.readyMs == 0) {
@@ -703,7 +732,6 @@ void radioModuleFound() {
 // arrived, and DeviceState (radioModuleStatus) tells hosts it is back.
 void radioModuleProbeLoop() {
   static uint32_t lastProbeMs = 0;
-  static uint32_t probes = 0;
   if (radioModuleStatus == RADIO_MODULE_FOUND || mode == MODE_TX) {
     return;
   }
@@ -711,8 +739,8 @@ void radioModuleProbeLoop() {
   if ((uint32_t)(now - lastProbeMs) < SA818_PROBE_INTERVAL_MS) {
     return;
   }
-  probes++;
-  if (probes % 3 == 0) {
+  sa818Probes++;
+  if (sa818Probes % 3 == 0) {  // Never on the first probe of an episode.
     pulseRadioPowerDown();
   }
   bool found = sa818Handshake(SA818_PROBE_ANSWER_MS);

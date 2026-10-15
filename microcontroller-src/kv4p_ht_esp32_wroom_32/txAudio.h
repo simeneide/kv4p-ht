@@ -91,6 +91,10 @@ static constexpr size_t TX_CREDIT_RESERVE_BYTES = 512;
 static constexpr size_t TX_JITTER_CAPACITY_BYTES = 8192;
 // Enough entries for frames of one ADPCM block or more (every known host), so
 // the byte limit is reached first; the +8 covers a partly played head frame.
+// Chunks start on block boundaries only if the ring wraps on one: txDecode()
+// realigns the decoder before every sink call, and popChunk() splits a chunk
+// that straddles the wrap into two calls.
+static_assert(TX_JITTER_CAPACITY_BYTES % AUDIO_FRAME_BYTES == 0, "TX ring must hold whole ADPCM blocks");
 static constexpr size_t TX_JITTER_CAPACITY_ENTRIES = TX_JITTER_CAPACITY_BYTES / AUDIO_FRAME_BYTES + 8;
 static constexpr uint32_t TX_JITTER_CAPACITY_MS =
     (uint32_t)((uint64_t)TX_JITTER_CAPACITY_BYTES * AUDIO_FRAME_SAMPLES_WIRE / AUDIO_FRAME_BYTES * 1000 / AUDIO_WIRE_SAMPLE_RATE);
