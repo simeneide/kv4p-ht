@@ -1,6 +1,6 @@
 /*
-KV4P-HT (see http://kv4p.com)
-Copyright (C) 2026 Vance Vagell
+KV4P-HT (see http://kv4p.com), pgpilot fork
+Copyright (C) 2026 Simen Eide
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by

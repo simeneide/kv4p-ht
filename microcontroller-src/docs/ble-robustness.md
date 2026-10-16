@@ -119,7 +119,9 @@ radio from another. The line goes out in release builds (it is sent as a
 `COMMAND_DEBUG_INFO` frame directly, not through `_LOGI`), is printed in plain
 text at the top of the boot banner, and is sent again on USB when a host starts
 talking without having reset the radio: its first `HostDesiredState` (session
-flags leave 0) or its first after 10 s without a USB command.
+flags leave 0) or its first after 10 s without a USB command, the latter at
+most once a minute so a host that is idle between overs does not get it on
+every key-down.
 
 ### When the reason is POWERON
 

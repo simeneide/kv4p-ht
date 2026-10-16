@@ -859,16 +859,23 @@ void radioModuleProbeLoop() {
 // host that opens it after boot without resetting the radio never saw the
 // boot report. Its handshake is its first desired state (the session flags
 // leave 0), or its first after this long without a USB command, which is a
-// new host on the cable. Either way it gets the radio's identity again.
+// new host on the cable. Either way it gets the radio's identity again. A
+// quiet spell is latched by any command and spent only by the desired state
+// that sends the identity, and the quiet re-send goes at most once a minute:
+// an idle host that only talks to key would otherwise get it every over.
 static constexpr uint32_t USB_HOST_QUIET_MS = 10000;
+static constexpr uint32_t USB_IDENTITY_RESEND_MIN_MS = 60000;
 uint32_t lastUsbHostCommandMs = 0;
+uint32_t lastUsbIdentitySentMs = 0;
+bool usbHostReturned = false;
 
 void handleCommands(ProtocolSession &session, RcvCommand command, uint8_t *params, size_t param_len) {
   const bool fromUsb = &session == &protocolUsbSession;
-  bool usbHostWasQuiet = false;
   if (fromUsb) {
     uint32_t now = millis();
-    usbHostWasQuiet = lastUsbHostCommandMs == 0 || now - lastUsbHostCommandMs >= USB_HOST_QUIET_MS;
+    if (lastUsbHostCommandMs == 0 || now - lastUsbHostCommandMs >= USB_HOST_QUIET_MS) {
+      usbHostReturned = true;
+    }
     lastUsbHostCommandMs = max<uint32_t>(1, now);
   }
   switch (command) {
@@ -911,8 +918,16 @@ void handleCommands(ProtocolSession &session, RcvCommand command, uint8_t *param
                 : !softSquelchEffect.isSoftOpen();
           }
         }
-        if (fromUsb && (usbHostWasQuiet || (oldSessionFlags == 0 && session.flags != 0))) {
-          sendRadioIdentity(*session.stream);
+        if (fromUsb) {
+          uint32_t now = millis();
+          bool sessionStarted = oldSessionFlags == 0 && session.flags != 0;
+          bool resendDue = usbHostReturned
+              && (lastUsbIdentitySentMs == 0 || now - lastUsbIdentitySentMs >= USB_IDENTITY_RESEND_MIN_MS);
+          if (sessionStarted || resendDue) {
+            sendRadioIdentity(*session.stream);
+            lastUsbIdentitySentMs = max<uint32_t>(1, now);
+          }
+          usbHostReturned = false;
         }
         if (sessionFlagsChanged || globalStateChanged) {
           reconcileDesiredState();
