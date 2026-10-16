@@ -855,7 +855,22 @@ void radioModuleProbeLoop() {
   }
 }
 
+// The USB port has no connect event (its session is always connected), so a
+// host that opens it after boot without resetting the radio never saw the
+// boot report. Its handshake is its first desired state (the session flags
+// leave 0), or its first after this long without a USB command, which is a
+// new host on the cable. Either way it gets the radio's identity again.
+static constexpr uint32_t USB_HOST_QUIET_MS = 10000;
+uint32_t lastUsbHostCommandMs = 0;
+
 void handleCommands(ProtocolSession &session, RcvCommand command, uint8_t *params, size_t param_len) {
+  const bool fromUsb = &session == &protocolUsbSession;
+  bool usbHostWasQuiet = false;
+  if (fromUsb) {
+    uint32_t now = millis();
+    usbHostWasQuiet = lastUsbHostCommandMs == 0 || now - lastUsbHostCommandMs >= USB_HOST_QUIET_MS;
+    lastUsbHostCommandMs = max<uint32_t>(1, now);
+  }
   switch (command) {
     case COMMAND_HOST_TX_AUDIO:
       if (mode == MODE_TX && !freeDv2400bEnabled()) {
@@ -895,6 +910,9 @@ void handleCommands(ProtocolSession &session, RcvCommand command, uint8_t *param
                 ? !freeDvSquelch.open()
                 : !softSquelchEffect.isSoftOpen();
           }
+        }
+        if (fromUsb && (usbHostWasQuiet || (oldSessionFlags == 0 && session.flags != 0))) {
+          sendRadioIdentity(*session.stream);
         }
         if (sessionFlagsChanged || globalStateChanged) {
           reconcileDesiredState();

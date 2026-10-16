@@ -103,6 +103,24 @@ RTS on open, clearing them one at a time passes through DTR off/RTS on, which
 is exactly the state the auto-reset transistors turn into EN low. Check for a
 boot banner right after opening before trusting a capture.
 
+### Which radio is reporting
+
+The report opens with the radio's identity, on every transport:
+
+```
+Radio id: kv4p-F0BC8D mac=28:56:2F:8D:BC:F0 bt=28:56:2F:8D:BC:F2
+```
+
+`kv4p-F0BC8D` is exactly the name the radio advertises over Bluetooth (the low
+three bytes of the factory MAC, last byte first; `radioIdentity.h`), `mac` that
+factory MAC and `bt` the Bluetooth MAC, the address an Android host sees. Over
+Bluetooth a host already knows the name; over USB it otherwise cannot tell one
+radio from another. The line goes out in release builds (it is sent as a
+`COMMAND_DEBUG_INFO` frame directly, not through `_LOGI`), is printed in plain
+text at the top of the boot banner, and is sent again on USB when a host starts
+talking without having reset the radio: its first `HostDesiredState` (session
+flags leave 0) or its first after 10 s without a USB command.
+
 ### When the reason is POWERON
 
 On the ESP32 `ESP_RST_POWERON` (ROM `rst:0x1`) covers a real supply collapse

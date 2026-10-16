@@ -19,6 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <Arduino.h>
 #include <driver/adc.h>
+#include "radioIdentity.h"
 
 // RF module types
 enum RfModuleType : uint8_t {
@@ -41,8 +42,7 @@ static constexpr uint32_t TX_AUDIO_TIMEOUT_MS =
   (uint32_t)TX_AUDIO_TIMEOUT_FRAMES * AUDIO_FRAME_SAMPLES_WIRE * 1000 / AUDIO_WIRE_SAMPLE_RATE;
 
 inline uint32_t bluetoothDeviceId() {
-  uint64_t mac = ESP.getEfuseMac();
-  return (uint32_t)((mac >> 24) & 0xFFFFFF);
+  return radioIdFromEfuseMac(ESP.getEfuseMac());
 }
 
 inline void formatBluetoothDeviceName(char *out, size_t outSize) {

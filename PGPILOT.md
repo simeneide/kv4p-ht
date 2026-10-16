@@ -28,6 +28,9 @@ changes are aimed at upstream and are described in detail in
   I2S call is guarded, and a failed install refuses the key with a
   `TX refused:` line, without keying the carrier, and retries a few times
   while PTT is held.
+* Names itself on every transport: the boot report opens with
+  `Radio id: kv4p-XXXXXX mac=... bt=...` (the advertised BLE name and the MACs
+  it comes from), so a host can tell which radio is on the USB cable.
 * Requests LE data length 251 and iOS-friendly BLE connection parameters.
 * Buffers TX audio from the host and plays it out at the DAC's pace, so a
   congested Bluetooth link (for example with a headset microphone open) gives

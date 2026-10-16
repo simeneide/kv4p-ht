@@ -57,8 +57,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <esp_system.h>
 #include <esp_attr.h>
 #include <esp_core_dump.h>
+#include <esp_mac.h>
 #include "protocol.h"
 #include "firmwareVersion.h"
+#include "radioIdentity.h"
 
 struct ResetBreadcrumb {
   uint32_t magic;
@@ -281,10 +283,30 @@ int formatCoreDumpLine(char *out, size_t outSize) {
 #endif
 }
 
+// "Radio id: kv4p-XXXXXX mac=... bt=..." (radioIdentity.h).
+int formatRadioIdentityLine(char *out, size_t outSize) {
+  uint8_t bt[6] = {0};
+  esp_read_mac(bt, ESP_MAC_BT);
+  return formatRadioIdLine(out, outSize, ESP.getEfuseMac(), bt);
+}
+
+// The identity on its own, for a USB host that starts talking after boot
+// (the boot report went out before it was listening).
+void sendRadioIdentity(Stream &out) {
+  char line[96];
+  int n = formatRadioIdentityLine(line, sizeof(line));
+  if (n > 0) {
+    sendKv4pVendorFrame(out, COMMAND_DEBUG_INFO, (const uint8_t *)line, strnlen(line, sizeof(line)));
+  }
+}
+
 // Plain text on the USB serial port, printed before any kv4p framing so it is
 // readable with any serial monitor.
 void printResetDiagnostics(Print &out) {
   char line[200];
+  if (formatRadioIdentityLine(line, sizeof(line)) > 0) {
+    out.println(line);
+  }
   if (formatResetReasonLine(line, sizeof(line)) > 0) {
     out.println(line);
   }
@@ -300,8 +322,10 @@ void printResetDiagnostics(Print &out) {
 
 // The same report as COMMAND_DEBUG_INFO frames to one host session. Sent on
 // every connect, so the same boot can be reported more than once; the boot
-// number tells repeats apart.
+// number tells repeats apart. It opens with the radio's identity, so every
+// host learns which radio is reporting, over USB as well as Bluetooth.
 void sendResetDiagnostics(Stream &out) {
+  sendRadioIdentity(out);
   char line[200];
   if (formatResetReasonLine(line, sizeof(line)) > 0) {
     sendKv4pVendorFrame(out, COMMAND_DEBUG_INFO, (const uint8_t *)line, strnlen(line, sizeof(line)));
